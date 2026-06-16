@@ -88,7 +88,9 @@ class TokenBucketRateLimiter(RateLimiter):
         if self.max_burst is None:
             self.max_burst = float(self.rate_per_second)
 
-        self._tokens: float = float(self.max_burst)
+        # 初始令牌设为 0，从 0 开始补充，避免初始突发导致前几秒 QPS 翻倍
+        # 这样稳态 QPS 更准确地等于 rate_per_second
+        self._tokens: float = 0.0
         self._last_refill_time: float = time.perf_counter()
         self._lock = threading.Lock()
         self._stopped = False

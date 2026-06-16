@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -256,6 +257,10 @@ class Scenario:
     - 参数化配置
     - 全局默认设置
     - 前置/后置钩子
+
+    步骤选择模式 (step_selection_mode):
+    - "sequential": 顺序执行所有步骤（默认），每轮迭代各步骤QPS必然相等
+    - "weighted_random": 每轮迭代按权重随机选择一个步骤执行，可实现不同步骤QPS比例
     """
     name: str
     steps: List[ScenarioStep] = field(default_factory=list)
@@ -266,11 +271,30 @@ class Scenario:
     teardown_hook: Optional[Callable[[ScenarioContext], None]] = None
     iteration_pause: float = 0.0
     description: str = ""
+    step_selection_mode: str = "sequential"
+    _weighted_steps: Optional[List[ScenarioStep]] = None
+    _rng: random.Random = field(default_factory=random.Random)
 
     def add_step(self, step: ScenarioStep) -> "Scenario":
         """添加步骤"""
         self.steps.append(step)
+        self._weighted_steps = None
         return self
+
+    def _build_weighted_steps(self) -> List[ScenarioStep]:
+        """构建加权步骤列表（用于 weighted_random 模式）
+        权重为 N 的步骤会在列表中出现 N 次。
+        """
+        if self._weighted_steps is not None:
+            return self._weighted_steps
+        weighted = []
+        enabled_steps = [s for s in self.steps if s.enabled]
+        for step in enabled_steps:
+            w = max(1, getattr(step, 'weight', 1) or 1)
+            for _ in range(w):
+                weighted.append(step)
+        self._weighted_steps = weighted
+        return weighted
 
     def add_parameter(self, param: Parameter) -> "Scenario":
         """添加参数"""
@@ -307,7 +331,11 @@ class Scenario:
         http_executor: Callable[[RequestResult], ResponseData],
         pre_step_callback: Optional[Callable[["ScenarioStep"], None]] = None,
     ) -> ScenarioResult:
-        """执行一次场景迭代（所有步骤）
+        """执行一次场景迭代
+
+        执行模式由 step_selection_mode 决定：
+        - "sequential": 顺序执行所有步骤（默认），每轮迭代各步骤QPS必然相等
+        - "weighted_random": 每轮迭代按权重随机选择一个步骤执行，可实现不同步骤QPS比例
 
         Args:
             context: 执行上下文（包含参数）
@@ -332,25 +360,37 @@ class Scenario:
             if self.setup_hook:
                 self.setup_hook(context)
 
-            # 执行步骤序列
-            for step in self.steps:
-                if not step.enabled:
-                    continue
+            if self.step_selection_mode == "weighted_random":
+                # 加权随机模式：每轮只执行一个步骤，按权重随机选择
+                weighted_steps = self._build_weighted_steps()
+                if weighted_steps:
+                    step = self._rng.choice(weighted_steps)
+                    if pre_step_callback:
+                        pre_step_callback(step)
+                    step_result = step.execute(context, http_executor, self.default_headers)
+                    result.steps.append(step_result)
+                    if step.think_time > 0:
+                        time.sleep(step.think_time)
+            else:
+                # 顺序模式：执行所有步骤
+                for step in self.steps:
+                    if not step.enabled:
+                        continue
 
-                # 步骤前回调（如限速）
-                if pre_step_callback:
-                    pre_step_callback(step)
+                    # 步骤前回调（如限速）
+                    if pre_step_callback:
+                        pre_step_callback(step)
 
-                step_result = step.execute(context, http_executor, self.default_headers)
-                result.steps.append(step_result)
+                    step_result = step.execute(context, http_executor, self.default_headers)
+                    result.steps.append(step_result)
 
-                # 思考时间
-                if step.think_time > 0:
-                    time.sleep(step.think_time)
+                    # 思考时间
+                    if step.think_time > 0:
+                        time.sleep(step.think_time)
 
-                # 失败中止检查
-                if not step_result.is_success and not step.continue_on_failure:
-                    break
+                    # 失败中止检查
+                    if not step_result.is_success and not step.continue_on_failure:
+                        break
 
             # Teardown钩子
             if self.teardown_hook:

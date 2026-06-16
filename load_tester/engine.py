@@ -253,7 +253,12 @@ class LoadTestEngine:
 
         # 2. 速率限制器（如果配置了QPS）
         initial_qps = self._get_initial_qps(config)
-        if initial_qps:
+        # 权重分摊模式：只要配置了 qps，就通过步骤级限速器按 weight 分摊总 QPS
+        # 这样总 HTTP QPS = sum(step_qps) ≈ qps，和全局限速效果一致，但更灵活
+        # 禁用全局 rate limiter，避免双重限制
+        use_global_rate_limiter = not (initial_qps and initial_qps > 0 and len(config.scenario.steps) > 0)
+
+        if initial_qps and use_global_rate_limiter:
             self._rate_limiter = TokenBucketRateLimiter(
                 rate_per_second=initial_qps,
                 busy_wait=config.rate_limiter_busy_wait,

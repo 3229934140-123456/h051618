@@ -473,6 +473,7 @@ class WorkerPool:
             每个CSV参数的汇总统计
         """
         csv_by_name: Dict[str, dict] = {}
+        csv_unique_rows: Dict[str, Set[int]] = {}  # 全局去重行号集合
         with self._lock:
             for wid, worker in self._workers.items():
                 if hasattr(worker, '_parameters') and worker._parameters is not None:
@@ -481,22 +482,26 @@ class WorkerPool:
                         call_count = csv_stat.get('call_count', 0)
                         loop_count = csv_stat.get('loop_count', 0)
                         looped = csv_stat.get('looped', False)
-                        rows_used = csv_stat.get('rows_used', 0)
+                        rows_used_worker = csv_stat.get('rows_used', 0)
+                        unique_rows_used = csv_stat.get('unique_rows_used', rows_used_worker)
                         rows_available = csv_stat.get('total_rows_available', csv_stat.get('total_rows_total', 0))
                         recycled = csv_stat.get('recycled', False)
                         rows_total = csv_stat.get('total_rows_total', 0)
+                        read_mode = csv_stat.get('read_mode', csv_stat.get('mode', 'unknown'))
+                        used_indices = csv_stat.get('_used_global_indices', [])
 
                         if name not in csv_by_name:
                             csv_by_name[name] = {
                                 'name': name,
                                 'type': 'csv',
                                 'csv_path': csv_stat.get('csv_path'),
-                                'read_mode': csv_stat.get('mode'),
-                                'mode': csv_stat.get('mode'),
+                                'read_mode': read_mode,
+                                'mode': read_mode,
                                 'total_rows': rows_total,
                                 'total_rows_available_sum': 0,
                                 'rows_used_max': 0,
                                 'rows_used_sum': 0,
+                                'unique_rows_used_global': 0,
                                 'total_call_count': 0,
                                 'workers_using': 0,
                                 'any_looped': False,
@@ -506,30 +511,46 @@ class WorkerPool:
                                 'call_count_per_worker': {},
                                 'loop_count_per_worker': {},
                             }
+                            csv_unique_rows[name] = set()
                         s = csv_by_name[name]
                         s['total_call_count'] += call_count
                         s['workers_using'] += 1
                         s['total_rows_available_sum'] += rows_available
-                        s['rows_used_sum'] += rows_used
-                        if rows_used > s['rows_used_max']:
-                            s['rows_used_max'] = rows_used
+                        s['rows_used_sum'] += unique_rows_used
+                        if unique_rows_used > s['rows_used_max']:
+                            s['rows_used_max'] = unique_rows_used
                         if looped:
                             s['any_looped'] = True
                         if recycled:
                             s['any_recycled'] = True
                         s['loop_counts'].append(loop_count)
-                        s['rows_used_per_worker'][wid] = rows_used
+                        s['rows_used_per_worker'][wid] = unique_rows_used
                         s['call_count_per_worker'][wid] = call_count
                         s['loop_count_per_worker'][wid] = loop_count
+                        # 累积全局去重行号
+                        csv_unique_rows[name].update(used_indices)
                         # 冗余字段，便于报告直接用
                         s['rows_used'] = s['rows_used_max']
                         s['call_count'] = s['total_call_count']
                         s['looped'] = s['any_looped']
                         s['loop_count'] = max(s['loop_counts']) if s['loop_counts'] else 0
                         s['recycled'] = s['any_recycled']
-                        s['coverage_pct'] = round(
-                            (s['rows_used_max'] / max(1, rows_total)) * 100, 2
-                        ) if rows_total else 0
+            # 后处理：基于全局去重行号计算覆盖率
+            for name, s in csv_by_name.items():
+                rows_total = s['total_rows']
+                read_mode = s['read_mode']
+                # worker_sharded: 分片不重叠，直接求和（等于csv_unique_rows大小）
+                # 其他模式：用全局去重集合大小
+                unique_global = len(csv_unique_rows.get(name, set()))
+                if read_mode == 'worker_sharded':
+                    coverage_rows = s['rows_used_sum']
+                else:
+                    coverage_rows = unique_global
+                s['unique_rows_used_global'] = coverage_rows
+                s['rows_used'] = coverage_rows  # 覆盖为全局真实覆盖
+                s['coverage_pct'] = round(
+                    (coverage_rows / max(1, rows_total)) * 100, 2
+                ) if rows_total else 0
         return list(csv_by_name.values())
 
     def start(self) -> None:

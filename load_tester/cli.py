@@ -282,14 +282,23 @@ def _cmd_preview(args) -> int:
             context = scenario.create_context(user_id=f"preview-u-{wid}-{i}")
             context.update(vars_dict)
 
-            # 记录 CSV 使用的行
+            # 记录 CSV 使用的行（按全局行号）
             for pstat in params.get_stats():
                 nm = pstat.get('name')
                 if pstat.get('type') == 'csv':
                     idx = pstat.get('current_index', 0)
                     total = pstat.get('total_rows_total', 0)
-                    # 当前正在使用的索引
-                    using_idx = (idx - 1) % max(1, total) if total else 0
+                    shard_start = pstat.get('_shard_start')
+                    shard_end = pstat.get('_shard_end')
+                    avail = pstat.get('total_rows_available', total)
+                    # 计算全局行号
+                    if shard_start is not None and avail:
+                        # 分片模式：全局行号 = shard_start + 分片内偏移
+                        local_idx = (idx - 1) % max(1, avail) if avail else 0
+                        using_idx = shard_start + local_idx
+                    else:
+                        # 其他模式：直接是文件内索引
+                        using_idx = (idx - 1) % max(1, total) if total else 0
                     csv_line_usage.setdefault(nm, set()).add(using_idx)
 
             if not worker_header_shown:
@@ -387,26 +396,75 @@ def _cmd_preview(args) -> int:
     # CSV 汇总
     if csv_line_usage:
         print(f"\n    CSV 数据池使用情况:")
-        all_csv_stats = None
-        # 拿第一份参数集的 meta 信息
-        params0 = scenario.parameters.clone()
-        for pstat in params0.get_stats():
-            if pstat.get('type') == 'csv':
-                nm = pstat.get('name')
-                if nm in csv_line_usage:
-                    total_rows = pstat.get('total_rows_total', 0)
-                    used_rows = len(csv_line_usage.get(nm, set()))
-                    looped = used_rows > total_rows if total_rows else False
-                    pct = (used_rows / max(1, total_rows)) * 100 if total_rows else 0
-                    pct_str = f"{pct:.1f}%" if total_rows else "N/A"
-                    tag = " [循环复用!]" if looped else ""
-                    print(f"      [{nm}] 使用 {used_rows}/{total_rows} 行 ({pct_str}){tag}")
-                    # 显示各 worker 消耗行数
-                    for wid_str in sorted(csv_rows_start.keys()):
-                        s = csv_rows_start[wid_str].get(nm, 0)
-                        e = csv_rows_end[wid_str].get(nm, 0)
-                        consumed = e - s
-                        print(f"        - {wid_str}: 消耗 {consumed} 行 (idx {s} -> {e})")
+        meta_params = scenario.parameters.clone()
+        for pstat in meta_params.get_stats():
+            if pstat.get('type') != 'csv':
+                continue
+            nm = pstat.get('name')
+            if nm not in csv_line_usage:
+                continue
+            total_rows = pstat.get('total_rows_total', 0)
+            mode = pstat.get('read_mode', pstat.get('mode', ''))
+            used_rows = len(csv_line_usage.get(nm, set()))
+            loop_config = pstat.get('loop', False)
+
+            pct = (used_rows / max(1, total_rows)) * 100 if total_rows else 0
+            pct_str = f"{pct:.1f}%" if total_rows else "N/A"
+
+            # 判断是否循环复用
+            looped_any = False
+            call_total = 0
+            per_worker_info = {}  # wid_str -> (s_local, e_local, consumed, sh_st, sh_av)
+            for wid_str2 in sorted(csv_rows_end.keys()):
+                s_local = csv_rows_start[wid_str2].get(nm, 0)
+                e_local = csv_rows_end[wid_str2].get(nm, 0)
+                consumed = e_local - s_local
+                call_total += consumed
+                # 获取 shard_start 和 sh_avail
+                wp = scenario.parameters.clone()
+                sh_st = None
+                sh_av = pstat.get('total_rows_available', total_rows)
+                if hasattr(wp, 'set_worker_context'):
+                    wp.set_worker_context(wid_str2, num_workers)
+                    for pst in wp.get_stats():
+                        if pst.get('name') == nm and pst.get('type') == 'csv':
+                            sh_st = pst.get('_shard_start')
+                            sh_av = pst.get('total_rows_available', total_rows)
+                            break
+                per_worker_info[wid_str2] = (s_local, e_local, consumed, sh_st, sh_av)
+                if consumed > max(1, sh_av):
+                    looped_any = True
+
+            tag = ""
+            if looped_any:
+                tag = " [♻️ 循环复用!]"
+            elif loop_config:
+                tag = " [loop=true]"
+
+            print(f"      [{nm}] 模式: {mode}  使用 {used_rows}/{total_rows} 行 ({pct_str}){tag}")
+
+            # 显示各 worker 消耗行数（按全局行号范围）
+            for wid_str2 in sorted(per_worker_info.keys()):
+                s_local, e_local, consumed, sh_st, sh_av = per_worker_info[wid_str2]
+                loop_mark = ""
+                if sh_st is not None:
+                    # 分片模式：用全局行号
+                    start_global = sh_st + (s_local % sh_av) if sh_av > 0 else sh_st
+                    end_global = sh_st + ((e_local - 1) % sh_av) if sh_av > 0 and e_local > 0 else start_global
+                    # 显示消耗范围，如果循环了就标出来
+                    if e_local > sh_av and sh_av > 0:
+                        loop_cnt = (e_local - 1) // sh_av
+                        loop_mark = f" [♻️ 循环 ×{loop_cnt}]"
+                    range_str = f"全局行 {start_global}-{end_global}"
+                else:
+                    # 非分片模式
+                    start_global = s_local % total_rows if total_rows > 0 else 0
+                    end_global = (e_local - 1) % total_rows if total_rows > 0 and e_local > 0 else start_global
+                    if e_local > total_rows and total_rows > 0:
+                        loop_cnt = (e_local - 1) // total_rows
+                        loop_mark = f" [♻️ 循环 ×{loop_cnt}]"
+                    range_str = f"行 {start_global}-{end_global}"
+                print(f"        - {wid_str2}: 消耗 {consumed} 行 ({range_str}){loop_mark}")
 
     # 计数器汇总
     has_counter = False

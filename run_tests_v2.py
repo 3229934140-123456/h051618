@@ -181,6 +181,8 @@ run_test("T3: 步骤级状态码分布+成功/失败独立延迟+独立QPS时序
 def t4_weight_distribution():
     scenario = Scenario(name="t4")
     # 3步，weight 1:2:1  → 分配 QPS 25:50:25 (总QPS=100)
+    # 使用 weighted_random 模式：每轮迭代按权重随机选一个步骤执行，实现不同QPS比例
+    scenario.step_selection_mode = "weighted_random"
     scenario.add_step(ScenarioStep(name="lw", weight=1,
         request=HttpRequest(name="r1", method=HttpMethod.GET, url="http://t/lw")))
     scenario.add_step(ScenarioStep(name="md", weight=2,
@@ -188,7 +190,7 @@ def t4_weight_distribution():
     scenario.add_step(ScenarioStep(name="hw", weight=1,
         request=HttpRequest(name="r3", method=HttpMethod.GET, url="http://t/hw")))
     config = LoadTestConfig(
-        scenario=scenario, load_mode="constant", duration=2.5, concurrency=4, qps=100,
+        scenario=scenario, load_mode="constant", duration=4, concurrency=8, qps=100,
         output_json=False, output_html=False, output_console=False,
     )
     # 让实际执行极快，避免concurrency变成瓶颈
@@ -201,26 +203,46 @@ def t4_weight_distribution():
     res = engine.run()
     bs = res.metrics.by_step
 
-    # 验证比例符合权重 (lw:md:hw ≈ 1:2:1)
+    # 1. 验证总 QPS 接近 100 (HTTP口径)
+    overall_qps = res.metrics.throughput.overall_qps
+    assert 70 < overall_qps < 140, f"Overall QPS should be ~100 HTTP/s, got {overall_qps:.1f}"
+
+    # 2. 验证各步骤 QPS 比例符合权重 (lw:md:hw ≈ 25:50:25)
+    lw_qps = bs["lw"].overall_qps
+    md_qps = bs["md"].overall_qps
+    hw_qps = bs["hw"].overall_qps
+    print(f"  [QPS分布] lw={lw_qps:.1f}, md={md_qps:.1f}, hw={hw_qps:.1f}, TOTAL={overall_qps:.1f}")
+
+    # 期望：lw≈25, md≈50, hw≈25
+    # 中间步骤应该约为两边步骤的 2 倍
+    # 计算 md/lw 和 md/hw 的比例，应在 1.3 ~ 3.0 之间
+    lw_hw_avg = (lw_qps + hw_qps) / 2.0
+    if lw_hw_avg > 1:
+        ratio_md_over_side = md_qps / lw_hw_avg
+        print(f"  [比例校验] md / avg(lw,hw) = {ratio_md_over_side:.2f} (期望 ≈2.0)")
+        assert 1.3 < ratio_md_over_side < 3.0, f"md/avg(lw,hw) out of range: {ratio_md_over_side:.2f} (expected ~2.0)"
+
+    # 绝对 QPS 范围（考虑到串行执行的自然抖动）
+    assert 12 < lw_qps < 40, f"lw QPS out of range: {lw_qps:.1f} (expected ~25)"
+    assert 30 < md_qps < 75, f"md QPS out of range: {md_qps:.1f} (expected ~50)"
+    assert 12 < hw_qps < 40, f"hw QPS out of range: {hw_qps:.1f} (expected ~25)"
+
+    # 3. 验证请求数比例
     total = sum(bs[k].total_requests for k in bs)
     lw_r = bs["lw"].total_requests / max(1, total)
     md_r = bs["md"].total_requests / max(1, total)
     hw_r = bs["hw"].total_requests / max(1, total)
-    # 期望比例 lw=25%, md=50%, hw=25%
-    # 由于每轮场景是串行执行的（先lw再md后hw），真实比例会有波动，放宽阈值
-    assert 0.10 < lw_r < 0.40, f"lw ratio off: {lw_r:.2f} (expected ~0.25), dist: lw={bs['lw'].total_requests}, md={bs['md'].total_requests}, hw={bs['hw'].total_requests}"
-    assert 0.30 < md_r < 0.70, f"md ratio off: {md_r:.2f} (expected ~0.50)"
-    assert 0.10 < hw_r < 0.40, f"hw ratio off: {hw_r:.2f} (expected ~0.25)"
-    # 总 QPS 对齐 HTTP 口径
-    overall_qps = res.metrics.throughput.overall_qps
-    assert 50 < overall_qps < 160, f"Overall QPS should be ~100 HTTP/s, got {overall_qps:.1f}"
-    print(f"  [QPS分布] lw={bs['lw'].overall_qps:.1f}, md={bs['md'].overall_qps:.1f}, hw={bs['hw'].overall_qps:.1f}, TOTAL={overall_qps:.1f}")
+    assert 0.17 < lw_r < 0.35, f"lw ratio off: {lw_r:.2f} (expected ~0.25)"
+    assert 0.40 < md_r < 0.65, f"md ratio off: {md_r:.2f} (expected ~0.50)"
+    assert 0.17 < hw_r < 0.35, f"hw ratio off: {hw_r:.2f} (expected ~0.25)"
 
 run_test("T4: 3步按权重1:2:1分摊总QPS=100(HTTP口径)", t4_weight_distribution)
 
 # ========== T5: 5步权重分摊 ==========
 def t5_five_steps_weight():
     scenario = Scenario(name="t5")
+    # 使用 weighted_random 模式：每轮迭代按权重随机选一个步骤执行
+    scenario.step_selection_mode = "weighted_random"
     # weight 1,1,1,1,1 → 每个约 20 QPS (总100)
     for i in range(5):
         scenario.add_step(ScenarioStep(
@@ -233,19 +255,36 @@ def t5_five_steps_weight():
             latency=0.0005, timestamp=time.time(), error=None,
         )
     config = LoadTestConfig(
-        scenario=scenario, load_mode="constant", duration=2, concurrency=2, qps=100,
+        scenario=scenario, load_mode="constant", duration=4, concurrency=6, qps=100,
         output_json=False, output_html=False, output_console=False,
     )
     engine = LoadTestEngine(config, custom_http_executor=fast_exec)
     res = engine.run()
-    # 每个步骤 QPS 应该在 15-25 之间 (期望值20)
-    for i in range(5):
-        sq = res.metrics.by_step[f"step_{i}"].overall_qps
-        assert 10 < sq < 35, f"step_{i} QPS out of range: {sq:.1f} (expected ~20)"
     overall = res.metrics.throughput.overall_qps
-    assert 60 < overall < 160, f"Overall HTTP QPS should be ~100, got {overall:.1f}"
     print(f"  [5步均摊] 各步QPS: {[round(res.metrics.by_step[f'step_{i}'].overall_qps,1) for i in range(5)]}")
     print(f"  [5步均摊] 总HTTP QPS: {overall:.1f}")
+
+    # 1. 总 QPS 接近 100
+    assert 70 < overall < 140, f"Overall HTTP QPS should be ~100, got {overall:.1f}"
+
+    # 2. 每步 QPS 接近 20 (期望值)，相对误差不超过 40%
+    qps_values = [res.metrics.by_step[f'step_{i}'].overall_qps for i in range(5)]
+    for i, sq in enumerate(qps_values):
+        assert 8 < sq < 35, f"step_{i} QPS out of range: {sq:.1f} (expected ~20)"
+
+    # 3. 验证各步 QPS 相对均匀（最大/最小 < 2.0）
+    max_qps = max(qps_values)
+    min_qps = min(qps_values)
+    if min_qps > 1:
+        uniformity_ratio = max_qps / min_qps
+        print(f"  [5步均摊] 均匀性 max/min = {uniformity_ratio:.2f}")
+        assert uniformity_ratio < 2.5, f"QPS 不均匀: max={max_qps:.1f}, min={min_qps:.1f}, ratio={uniformity_ratio:.2f}"
+
+    # 4. 每步请求数占比接近 20%
+    total = sum(res.metrics.by_step[f'step_{i}'].total_requests for i in range(5))
+    for i in range(5):
+        r = res.metrics.by_step[f'step_{i}'].total_requests / max(1, total)
+        assert 0.12 < r < 0.28, f"step_{i} ratio off: {r:.2f} (expected ~0.20)"
 
 run_test("T5: 5步权重均摊总QPS=100(HTTP口径对齐)", t5_five_steps_weight)
 

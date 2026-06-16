@@ -420,6 +420,7 @@ class CsvParameter(Parameter):
         self._rng = random.Random(seed)
         self._sharded_rows: List[Dict[str, Any]] = []  # worker分片后的行
         self._initial_rows: List[Dict[str, Any]] = []
+        self._used_global_row_indices: Set[int] = set()  # 实际用到的全局行号（去重）
 
         if self.csv_path:
             self._load_csv()
@@ -483,6 +484,7 @@ class CsvParameter(Parameter):
         if self.mode == CsvReadMode.RANDOM:
             # 随机模式：每次随机选一行
             idx = self._rng.randint(0, len(rows) - 1)
+            self._used_global_row_indices.add(idx)
             return rows[idx]
 
         # 顺序 / 分片模式
@@ -494,6 +496,12 @@ class CsvParameter(Parameter):
                 return rows[-1]
 
         value = rows[self._index]
+        # 计算全局行号（去重追踪）
+        if self.mode == CsvReadMode.WORKER_SHARDED and self._shard_start_idx is not None:
+            global_idx = self._shard_start_idx + self._index
+        else:
+            global_idx = self._index
+        self._used_global_row_indices.add(global_idx)
         self._index += 1
         return value
 
@@ -505,6 +513,7 @@ class CsvParameter(Parameter):
         stats = super().get_stats()
         rows = self._sharded_rows if self.mode == CsvReadMode.WORKER_SHARDED else self._rows
         total_rows = len(rows)
+        unique_rows_used = len(self._used_global_row_indices)
         stats.update({
             "csv_path": str(self.csv_path) if self.csv_path else None,
             "total_rows_total": len(self._rows),
@@ -515,14 +524,16 @@ class CsvParameter(Parameter):
             "current_index": self._index,
             "loop_count": self._loop_count,
             "looped": self._loop_count > 0,
-            "rows_used": min(self._call_count, total_rows) if self.mode != CsvReadMode.RANDOM else self._call_count,
-            "recycled": self._loop_count > 0 or (self.mode == CsvReadMode.RANDOM and self._call_count > total_rows),
+            "rows_used": unique_rows_used,
+            "unique_rows_used": unique_rows_used,
+            "recycled": self._loop_count > 0 or (self._call_count > total_rows),
             "_shard_start": self._shard_start_idx,
             "_shard_end": self._shard_end_idx,
             "shard_start": self._shard_start_idx,
             "shard_end": self._shard_end_idx,
             "worker_id": self._worker_id,
             "total_workers": self._total_workers,
+            "_used_global_indices": list(self._used_global_row_indices),
         })
         return stats
 
