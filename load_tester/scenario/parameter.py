@@ -39,6 +39,13 @@ class ParameterType(str, Enum):
     CUSTOM = "custom"
 
 
+class CsvReadMode(str, Enum):
+    """CSV读取模式"""
+    SEQUENTIAL = "sequential"      # 顺序读取（默认）
+    RANDOM = "random"              # 随机读取
+    WORKER_SHARDED = "worker_sharded"  # 按Worker分片（每个Worker读取不同行）
+
+
 class Parameter:
     """参数基类"""
 
@@ -50,6 +57,8 @@ class Parameter:
             name = f"inline_param_{Parameter._auto_name_counter}"
         self.name = name
         self.type = param_type
+        # 统计
+        self._call_count = 0  # next_value 调用次数
 
     def next_value(self, context: dict) -> Any:
         """生成下一个参数值，由子类实现"""
@@ -58,6 +67,26 @@ class Parameter:
     def reset(self) -> None:
         """重置参数状态（可用于场景迭代）"""
         pass
+
+    def get_stats(self) -> dict:
+        """获取参数使用统计
+
+        Returns:
+            包含调用次数、循环次数等信息的字典
+        """
+        return {
+            "name": self.name,
+            "type": self.type.value if self.type else "unknown",
+            "call_count": self._call_count,
+        }
+
+    def clone(self) -> "Parameter":
+        """克隆一个参数实例（每个Worker独立一份，避免并发问题）
+
+        子类应重写此方法以正确复制状态。
+        """
+        import copy
+        return copy.deepcopy(self)
 
 
 class ConstantParameter(Parameter):
@@ -215,18 +244,22 @@ class SequenceParameter(Parameter):
         elif len(args) == 1:
             self.values = args[0]
         else:
-            self.values = values
+            self.values = values or []
         self.loop = loop
         self.per_worker = per_worker
         self._index = 0
+        self._loop_count = 0
+        self._initial_values = list(self.values) if self.values else []
 
     def next_value(self, context: dict) -> Any:
+        self._call_count += 1
         if not self.values:
             return None
 
         if self._index >= len(self.values):
             if self.loop:
                 self._index = 0
+                self._loop_count += 1
             else:
                 return self.values[-1]
 
@@ -236,6 +269,26 @@ class SequenceParameter(Parameter):
 
     def reset(self) -> None:
         self._index = 0
+        self._loop_count = 0
+
+    def get_stats(self) -> dict:
+        stats = super().get_stats()
+        stats.update({
+            "total_values": len(self.values),
+            "current_index": self._index,
+            "loop_count": self._loop_count,
+            "looped": self._loop_count > 0,
+        })
+        return stats
+
+    def clone(self) -> "SequenceParameter":
+        p = SequenceParameter(
+            name=self.name,
+            values=list(self._initial_values),
+            loop=self.loop,
+            per_worker=self.per_worker,
+        )
+        return p
 
 
 class UuidParameter(Parameter):
@@ -287,8 +340,10 @@ class CounterParameter(Parameter):
         self.width = width
         self.pad_char = pad_char
         self._value = self.start
+        self._initial_start = self.start
 
     def next_value(self, context: dict) -> Any:
+        self._call_count += 1
         current = self._value
         self._value += self.step
         if self.width:
@@ -298,11 +353,35 @@ class CounterParameter(Parameter):
     def reset(self) -> None:
         self._value = self.start
 
+    def get_stats(self) -> dict:
+        stats = super().get_stats()
+        stats.update({
+            "start": self.start,
+            "step": self.step,
+            "current_value": self._value,
+            "total_increments": self._call_count,
+        })
+        return stats
+
+    def clone(self) -> "CounterParameter":
+        p = CounterParameter(
+            name=self.name,
+            start=self._initial_start,
+            step=self.step,
+            width=self.width,
+            pad_char=self.pad_char,
+        )
+        return p
+
 
 class CsvParameter(Parameter):
     """CSV数据源参数
 
     从CSV文件读取，支持每行产生一个字典或多个独立参数。
+    支持3种读取模式：
+    - sequential: 顺序读取（默认）
+    - random: 随机读取
+    - worker_sharded: 按Worker分片（每个Worker读取不同的行段）
     """
 
     def __init__(
@@ -313,6 +392,10 @@ class CsvParameter(Parameter):
         columns: Optional[List[str]] = None,
         loop: bool = True,
         delimiter: str = ",",
+        mode: Union[CsvReadMode, str] = CsvReadMode.SEQUENTIAL,
+        worker_id: Optional[str] = None,
+        total_workers: int = 1,
+        seed: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(name, ParameterType.CSV)
@@ -326,10 +409,21 @@ class CsvParameter(Parameter):
         self.columns = columns
         self.loop = loop
         self.delimiter = delimiter
+        self.mode = CsvReadMode(mode) if isinstance(mode, str) else mode
+        self._worker_id = worker_id
+        self._total_workers = total_workers
+        self._seed = seed
+
         self._rows: List[Dict[str, Any]] = []
         self._index = 0
+        self._loop_count = 0
+        self._rng = random.Random(seed)
+        self._sharded_rows: List[Dict[str, Any]] = []  # worker分片后的行
+        self._initial_rows: List[Dict[str, Any]] = []
+
         if self.csv_path:
             self._load_csv()
+            self._init_sharding()
 
     def _load_csv(self) -> None:
         with open(self.csv_path, "r", encoding="utf-8") as f:
@@ -338,23 +432,100 @@ class CsvParameter(Parameter):
                 self._rows = [{c: row[c] for c in self.columns if c in row} for row in reader]
             else:
                 self._rows = [dict(row) for row in reader]
+        self._initial_rows = list(self._rows)
+
+    def _init_sharding(self) -> None:
+        """根据worker分片初始化数据"""
+        if self.mode == CsvReadMode.WORKER_SHARDED and self._rows:
+            total = len(self._rows)
+            per_worker = max(1, total // self._total_workers)
+            # 通过 worker_id 哈希或序号确定分片
+            worker_idx = 0
+            if self._worker_id:
+                # 从 worker id 中提取数字序号
+                import re
+                match = re.search(r'(\d+)', str(self._worker_id))
+                if match:
+                    worker_idx = int(match.group(1)) % self._total_workers
+                else:
+                    worker_idx = hash(self._worker_id) % self._total_workers
+
+            start = worker_idx * per_worker
+            # 最后一个worker取剩下的所有行
+            if worker_idx == self._total_workers - 1:
+                self._sharded_rows = self._rows[start:]
+            else:
+                self._sharded_rows = self._rows[start:start + per_worker]
+        else:
+            self._sharded_rows = self._rows
+
+    def set_worker_context(self, worker_id: str, total_workers: int) -> None:
+        """设置Worker上下文（用于分片模式）"""
+        self._worker_id = worker_id
+        self._total_workers = max(1, total_workers)
+        self._init_sharding()
+        self._index = 0
+        self._loop_count = 0
 
     def next_value(self, context: dict) -> Any:
-        if not self._rows:
+        self._call_count += 1
+        rows = self._sharded_rows if self.mode == CsvReadMode.WORKER_SHARDED else self._rows
+
+        if not rows:
             return {}
 
-        if self._index >= len(self._rows):
+        if self.mode == CsvReadMode.RANDOM:
+            # 随机模式：每次随机选一行
+            idx = self._rng.randint(0, len(rows) - 1)
+            return rows[idx]
+
+        # 顺序 / 分片模式
+        if self._index >= len(rows):
             if self.loop:
                 self._index = 0
+                self._loop_count += 1
             else:
-                return self._rows[-1]
+                return rows[-1]
 
-        value = self._rows[self._index]
+        value = rows[self._index]
         self._index += 1
         return value
 
     def reset(self) -> None:
         self._index = 0
+        self._loop_count = 0
+
+    def get_stats(self) -> dict:
+        stats = super().get_stats()
+        rows = self._sharded_rows if self.mode == CsvReadMode.WORKER_SHARDED else self._rows
+        total_rows = len(rows)
+        stats.update({
+            "csv_path": str(self.csv_path) if self.csv_path else None,
+            "total_rows_total": len(self._rows),
+            "total_rows_available": total_rows,
+            "mode": self.mode.value,
+            "loop": self.loop,
+            "current_index": self._index,
+            "loop_count": self._loop_count,
+            "looped": self._loop_count > 0,
+            "rows_used": min(self._call_count, total_rows) if self.mode != CsvReadMode.RANDOM else self._call_count,
+            "recycled": self._loop_count > 0 or (self.mode == CsvReadMode.RANDOM and self._call_count > total_rows),
+        })
+        return stats
+
+    def clone(self) -> "CsvParameter":
+        p = CsvParameter(
+            name=self.name,
+            csv_path=str(self.csv_path) if self.csv_path else None,
+            columns=list(self.columns) if self.columns else None,
+            loop=self.loop,
+            delimiter=self.delimiter,
+            mode=self.mode,
+            worker_id=self._worker_id,
+            total_workers=self._total_workers,
+            seed=self._seed,
+        )
+        return p
 
 
 class DatetimeParameter(Parameter):
@@ -498,6 +669,32 @@ class ParameterSet:
         """重置所有参数状态"""
         for param in self.parameters:
             param.reset()
+
+    def clone(self) -> "ParameterSet":
+        """克隆一个参数集合（每个Worker独立一份，避免并发问题）"""
+        cloned = ParameterSet(parameters=[])
+        for param in self.parameters:
+            cloned.parameters.append(param.clone())
+        cloned._rebuild_map()
+        return cloned
+
+    def set_worker_context(self, worker_id: str, total_workers: int) -> None:
+        """为所有CSV参数设置Worker上下文（用于分片模式）"""
+        for param in self.parameters:
+            if hasattr(param, 'set_worker_context'):
+                param.set_worker_context(worker_id, total_workers)
+
+    def get_stats(self) -> List[dict]:
+        """获取所有参数的使用统计"""
+        return [p.get_stats() for p in self.parameters]
+
+    def get_csv_stats(self) -> List[dict]:
+        """仅获取CSV参数的统计信息（用于报告）"""
+        return [
+            p.get_stats()
+            for p in self.parameters
+            if p.type == ParameterType.CSV
+        ]
 
     def __iter__(self) -> Iterator[Parameter]:
         return iter(self.parameters)

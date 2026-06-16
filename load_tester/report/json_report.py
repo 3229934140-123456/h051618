@@ -135,6 +135,12 @@ class JsonReporter:
             for name, lat in m.by_name.items()
         }
 
+        # 按步骤详细统计
+        by_step = {}
+        if hasattr(m, 'by_step') and m.by_step:
+            for name, step_m in m.by_step.items():
+                by_step[name] = step_m.to_dict()
+
         # 状态分布
         by_status = m.by_status
 
@@ -188,6 +194,7 @@ class JsonReporter:
             "throughput": throughput,
             "errors": errors,
             "by_name": by_name,
+            "by_step": by_step,
             "by_status": by_status,
         }
         if scenario:

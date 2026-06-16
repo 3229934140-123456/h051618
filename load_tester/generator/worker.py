@@ -113,14 +113,18 @@ class Worker:
         http_executor: Callable[[RequestResult], ResponseData] = _default_http_executor,
         result_callback: Optional[Callable[[WorkerResult], None]] = None,
         rate_limiter=None,
+        step_rate_limiters: Optional[Dict[str, Any]] = None,
         global_stop_event: Optional[threading.Event] = None,
+        total_workers: int = 1,
     ):
         self.worker_id = worker_id
         self.scenario = scenario
         self.http_executor = http_executor
         self.result_callback = result_callback
         self.rate_limiter = rate_limiter
+        self.step_rate_limiters = step_rate_limiters or {}
         self.global_stop_event = global_stop_event or threading.Event()
+        self._total_workers = total_workers
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -128,6 +132,8 @@ class Worker:
         self._iterations_completed: int = 0
         self._iterations_failed: int = 0
         self._is_running = False
+        # 每个Worker独立的参数集合（避免并发问题，计数器/CSV独立推进）
+        self._parameters: Optional[ParameterSet] = None
 
     @property
     def is_running(self) -> bool:
@@ -176,6 +182,19 @@ class Worker:
     def _run(self) -> None:
         """Worker 主循环"""
         try:
+            # 初始化独立的参数集合（每个Worker一份，避免并发问题）
+            self._parameters = self.scenario.parameters.clone()
+            # 设置CSV分片上下文
+            self._parameters.set_worker_context(self.worker_id, self._total_workers)
+
+            # 创建上下文（使用独立参数集初始化）
+            if self._context is None:
+                initial_vars = self._parameters.generate()
+                self._context = self.scenario.create_context(
+                    user_id=self.worker_id,
+                    initial_vars=initial_vars,
+                )
+
             # 包装 http_executor，在每个HTTP请求前获取令牌（按请求限速）
             original_executor = self.http_executor
             rate_limiter = self.rate_limiter
@@ -202,12 +221,22 @@ class Worker:
 
             effective_executor = rate_limited_executor
 
+            # 步骤级限速回调
+            step_rate_limiters = self.step_rate_limiters
+            def pre_step_hook(step):
+                if self._should_stop():
+                    return
+                rl = step_rate_limiters.get(step.name)
+                if rl is not None:
+                    try:
+                        rl.acquire(1)
+                    except Exception:
+                        pass
+
             while not self._should_stop():
-                # 每次迭代前重新生成参数
-                if self._context is not None:
-                    # 重置所有参数，重新生成随机值
-                    self.scenario.parameters.reset()
-                    new_params = self.scenario.parameters.generate()
+                # 每次迭代重新生成参数值（不reset，计数器/CSV自然推进）
+                if self._parameters is not None:
+                    new_params = self._parameters.generate()
                     # 保留已提取的变量（如token、user_id等），但参数化的值重新生成
                     for k, v in new_params.items():
                         self._context.variables[k] = v
@@ -215,11 +244,12 @@ class Worker:
                 if self._should_stop():
                     break
 
-                # 执行一次场景迭代（限速已在http_executor中按请求处理）
+                # 执行一次场景迭代（限速：全局在http_executor中按请求处理，步骤级在pre_step_hook中）
                 try:
                     scenario_result = self.scenario.run_iteration(
                         context=self._context,
                         http_executor=effective_executor,
+                        pre_step_callback=pre_step_hook,
                     )
 
                     self._iterations_completed += 1
@@ -307,12 +337,28 @@ class WorkerPool:
         self._result_callback = result_callback
         self._rate_limiter = rate_limiter
         self._auto_restart = auto_restart
+        self._target_total_workers = num_workers  # 目标总worker数（用于CSV分片）
+
+        # 步骤级rate limiter（按步骤名 -> RateLimiter，所有Worker共享）
+        self._step_rate_limiters: Dict[str, Any] = {}
+        self._init_step_rate_limiters()
 
         self._workers: Dict[str, Worker] = {}
         self._lock = threading.Lock()
         self._global_stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._is_running = False
+
+    def _init_step_rate_limiters(self) -> None:
+        """为每个配置了qps_limit的步骤创建独立的令牌桶限速器"""
+        from .rate_limiter import TokenBucketRateLimiter
+        for step in self.scenario.steps:
+            if not step.enabled:
+                continue
+            if step.qps_limit is not None and step.qps_limit > 0:
+                self._step_rate_limiters[step.name] = TokenBucketRateLimiter(
+                    rate_per_second=step.qps_limit,
+                )
 
     @property
     def active_workers(self) -> int:
@@ -347,8 +393,56 @@ class WorkerPool:
             http_executor=self._http_executor,
             result_callback=self._result_callback,
             rate_limiter=self._rate_limiter,
+            step_rate_limiters=self._step_rate_limiters,
             global_stop_event=self._global_stop_event,
+            total_workers=self._target_total_workers,
         )
+
+    def get_parameter_stats(self) -> List[dict]:
+        """收集所有Worker的参数使用统计
+
+        Returns:
+            每个Worker的参数统计列表
+        """
+        all_stats = []
+        with self._lock:
+            for wid, worker in self._workers.items():
+                if hasattr(worker, '_parameters') and worker._parameters is not None:
+                    stats = worker._parameters.get_stats()
+                    for s in stats:
+                        s['worker_id'] = wid
+                    all_stats.extend(stats)
+        return all_stats
+
+    def get_csv_stats_summary(self) -> List[dict]:
+        """获取CSV参数统计的汇总（合并所有Worker）
+
+        Returns:
+            每个CSV参数的汇总统计
+        """
+        csv_by_name: Dict[str, dict] = {}
+        with self._lock:
+            for wid, worker in self._workers.items():
+                if hasattr(worker, '_parameters') and worker._parameters is not None:
+                    for csv_stat in worker._parameters.get_csv_stats():
+                        name = csv_stat.get('name', 'unknown')
+                        if name not in csv_by_name:
+                            csv_by_name[name] = {
+                                'name': name,
+                                'csv_path': csv_stat.get('csv_path'),
+                                'mode': csv_stat.get('mode'),
+                                'total_rows': csv_stat.get('total_rows_total', 0),
+                                'total_call_count': 0,
+                                'workers_using': 0,
+                                'any_looped': False,
+                                'loop_counts': [],
+                            }
+                        csv_by_name[name]['total_call_count'] += csv_stat.get('call_count', 0)
+                        csv_by_name[name]['workers_using'] += 1
+                        if csv_stat.get('looped', False):
+                            csv_by_name[name]['any_looped'] = True
+                        csv_by_name[name]['loop_counts'].append(csv_stat.get('loop_count', 0))
+        return list(csv_by_name.values())
 
     def start(self) -> None:
         """启动所有初始 Worker 并开始监控"""

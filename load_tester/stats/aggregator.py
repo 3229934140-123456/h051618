@@ -132,6 +132,38 @@ class ScenarioMetrics:
 
 
 @dataclass
+class StepMetrics:
+    """单步骤的完整统计指标"""
+    name: str = ""
+    total_requests: int = 0
+    total_success: int = 0
+    total_failures: int = 0
+    success_rate: float = 0.0
+    overall_qps: float = 0.0
+    peak_qps: float = 0.0
+    latency: PercentileMetrics = field(default_factory=PercentileMetrics)
+    errors: ErrorMetrics = field(default_factory=ErrorMetrics)
+    qps_series: List[Tuple[float, float]] = field(default_factory=list)  # [(timestamp, qps), ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "total_requests": self.total_requests,
+            "total_success": self.total_success,
+            "total_failures": self.total_failures,
+            "success_rate": round(self.success_rate * 100, 2),
+            "overall_qps": round(self.overall_qps, 2),
+            "peak_qps": round(self.peak_qps, 2),
+            "latency": self.latency.to_dict(),
+            "errors": self.errors.to_dict(),
+            "qps_series": [
+                {"timestamp": ts, "qps": round(qps, 2)}
+                for ts, qps in self.qps_series
+            ],
+        }
+
+
+@dataclass
 class AggregatedMetrics:
     """综合聚合指标"""
     start_time: float = 0.0
@@ -144,8 +176,13 @@ class AggregatedMetrics:
     by_name: Dict[str, PercentileMetrics] = field(default_factory=dict)
     by_status: Dict[str, int] = field(default_factory=dict)
     histogram_snapshot: Optional[HistogramSnapshot] = None
+    # 按步骤/请求名的详细统计
+    by_step: Dict[str, StepMetrics] = field(default_factory=dict)
     # 场景口径统计（独立）
     scenario: ScenarioMetrics = field(default_factory=ScenarioMetrics)
+    # 参数/CSV使用统计
+    parameter_stats: List[Dict[str, Any]] = field(default_factory=list)
+    csv_stats: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -156,8 +193,11 @@ class AggregatedMetrics:
             "throughput": self.throughput.to_dict(),
             "errors": self.errors.to_dict(),
             "by_name": {k: v.to_dict() for k, v in self.by_name.items()},
+            "by_step": {k: v.to_dict() for k, v in self.by_step.items()},
             "by_status": {k.value if hasattr(k, "value") else k: v for k, v in self.by_status.items()},
             "scenario": self.scenario.to_dict(),
+            "parameter_stats": self.parameter_stats,
+            "csv_stats": self.csv_stats,
         }
 
 
@@ -235,6 +275,26 @@ class MetricsAggregator(MetricsSink):
         # 时间范围
         self._first_ts: Optional[float] = None
         self._last_ts: Optional[float] = None
+
+        # ========== 按步骤/请求名的详细统计 ==========
+        # 每个步骤独立的直方图
+        self._step_histograms: Dict[str, HdrHistogram] = {}
+        # 每个步骤的计数
+        self._step_total: Dict[str, int] = defaultdict(int)
+        self._step_success: Dict[str, int] = defaultdict(int)
+        self._step_failure: Dict[str, int] = defaultdict(int)
+        # 每个步骤的状态码分布
+        self._step_status_codes: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        # 每个步骤的错误消息分布
+        self._step_error_msgs: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        # 每个步骤的时间分桶（用于QPS时序）
+        self._step_buckets: Dict[str, Deque[Tuple[float, int, int]]] = defaultdict(
+            lambda: deque(maxlen=keep_time_buckets)
+        )
+        # 每个步骤的当前分桶
+        self._step_current_bucket_ts: Dict[str, float] = {}
+        self._step_current_bucket_total: Dict[str, int] = defaultdict(int)
+        self._step_current_bucket_success: Dict[str, int] = defaultdict(int)
 
         # 锁
         self._lock = threading.RLock()
@@ -321,6 +381,54 @@ class MetricsAggregator(MetricsSink):
             if sample.is_success:
                 self._current_bucket_success += 1
 
+            # ========== 步骤级统计 ==========
+            # 直方图
+            if name not in self._step_histograms:
+                self._step_histograms[name] = HdrHistogram(
+                    lowest_value_ns=self._hist_lo,
+                    highest_value_ns=self._hist_hi,
+                    significant_digits=self._sig_digits,
+                )
+            self._step_histograms[name].record_value(latency_ns)
+
+            # 计数
+            self._step_total[name] += 1
+            if sample.is_success:
+                self._step_success[name] += 1
+            else:
+                self._step_failure[name] += 1
+
+            # 状态码
+            if sample.status_code:
+                self._step_status_codes[name][sample.status_code] += 1
+
+            # 错误消息
+            if sample.is_error and sample.error_message:
+                key = sample.error_message[:200]
+                self._step_error_msgs[name][key] += 1
+
+            # 时间分桶（按步骤）
+            bucket_ts = math.floor(ts / self._bucket_size) * self._bucket_size
+            cur_ts = self._step_current_bucket_ts.get(name)
+            if cur_ts is None:
+                self._step_current_bucket_ts[name] = bucket_ts
+                self._step_current_bucket_total[name] = 0
+                self._step_current_bucket_success[name] = 0
+            elif bucket_ts != cur_ts:
+                # 上一个桶结束，入队
+                self._step_buckets[name].append((
+                    cur_ts,
+                    self._step_current_bucket_total[name],
+                    self._step_current_bucket_success[name],
+                ))
+                self._step_current_bucket_ts[name] = bucket_ts
+                self._step_current_bucket_total[name] = 0
+                self._step_current_bucket_success[name] = 0
+
+            self._step_current_bucket_total[name] += 1
+            if sample.is_success:
+                self._step_current_bucket_success[name] += 1
+
         elif sample.sample_type == SampleType.SCENARIO:
             # ========== 场景级统计 ==========
             self._scenario_histogram.record_value(latency_ns)
@@ -371,10 +479,13 @@ class MetricsAggregator(MetricsSink):
                 for name, hist in self._name_histograms.items()
             }
 
-            # 5. 状态分布（转普通dict）
+            # 5. 按步骤的详细统计
+            by_step = self._build_all_step_metrics(duration)
+
+            # 6. 状态分布（转普通dict）
             by_status = {k.value: v for k, v in self._status_counts.items()}
 
-            # 6. 场景级统计（独立）
+            # 7. 场景级统计（独立）
             scenario_metrics = self._build_scenario_metrics(duration)
 
             metrics = AggregatedMetrics(
@@ -385,6 +496,7 @@ class MetricsAggregator(MetricsSink):
                 throughput=throughput,
                 errors=errors,
                 by_name=by_name,
+                by_step=by_step,
                 by_status=by_status,
                 histogram_snapshot=self._histogram.snapshot(),
                 scenario=scenario_metrics,
@@ -462,6 +574,68 @@ class MetricsAggregator(MetricsSink):
         m.p999_ms = pcts.get("p99.9", 0) * ns_to_ms
         m.p9999_ms = pcts.get("p99.99", 0) * ns_to_ms
         return m
+
+    def _build_all_step_metrics(self, duration: float) -> Dict[str, StepMetrics]:
+        """构建所有步骤的详细统计"""
+        result: Dict[str, StepMetrics] = {}
+
+        for name, hist in self._step_histograms.items():
+            sm = StepMetrics(name=name)
+            sm.total_requests = self._step_total.get(name, 0)
+            sm.total_success = self._step_success.get(name, 0)
+            sm.total_failures = self._step_failure.get(name, 0)
+            sm.success_rate = (
+                sm.total_success / sm.total_requests
+                if sm.total_requests > 0
+                else 0.0
+            )
+            sm.overall_qps = sm.total_requests / duration if duration > 0 else 0.0
+            sm.latency = self._histogram_to_percentile_metrics(hist)
+
+            # 错误统计
+            err = ErrorMetrics()
+            err.total_errors = sm.total_failures
+            err.error_rate = 1.0 - sm.success_rate if sm.total_requests > 0 else 0.0
+            err.by_status_code = dict(self._step_status_codes.get(name, {}))
+            err_msgs = dict(self._step_error_msgs.get(name, {}))
+            err.by_error_message = err_msgs
+            if err_msgs:
+                sorted_errs = sorted(
+                    err_msgs.items(),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )[: self._top_errors_limit]
+                err.top_errors = [
+                    (msg, cnt, cnt / sm.total_requests if sm.total_requests > 0 else 0)
+                    for msg, cnt in sorted_errs
+                ]
+            sm.errors = err
+
+            # QPS 时间线（按秒去重）
+            qps_by_ts: Dict[float, float] = {}
+            peak = 0.0
+            for bucket_ts, total, _success in self._step_buckets.get(name, deque()):
+                qps = total / self._bucket_size
+                if qps > peak:
+                    peak = qps
+                qps_by_ts[bucket_ts] = qps
+
+            # 当前桶
+            cur_ts = self._step_current_bucket_ts.get(name)
+            cur_total = self._step_current_bucket_total.get(name, 0)
+            if cur_ts is not None and cur_total > 0:
+                qps = cur_total / self._bucket_size
+                if qps > peak:
+                    peak = qps
+                if cur_ts not in qps_by_ts or qps > qps_by_ts[cur_ts]:
+                    qps_by_ts[cur_ts] = qps
+
+            sm.peak_qps = peak
+            sm.qps_series = sorted(qps_by_ts.items(), key=lambda x: x[0])
+
+            result[name] = sm
+
+        return result
 
     def _build_scenario_metrics(self, duration: float) -> ScenarioMetrics:
         """构建场景级统计"""

@@ -130,6 +130,7 @@ class ScenarioStep:
     continue_on_failure: bool = False
     weight: int = 1
     enabled: bool = True
+    qps_limit: Optional[float] = None  # 步骤级QPS限制（每秒最大请求数）
 
     def execute(
         self,
@@ -304,12 +305,14 @@ class Scenario:
         self,
         context: ScenarioContext,
         http_executor: Callable[[RequestResult], ResponseData],
+        pre_step_callback: Optional[Callable[["ScenarioStep"], None]] = None,
     ) -> ScenarioResult:
         """执行一次场景迭代（所有步骤）
 
         Args:
             context: 执行上下文（包含参数）
             http_executor: HTTP执行函数
+            pre_step_callback: 每个步骤执行前的回调（可用于限速等）
 
         Returns:
             场景执行结果
@@ -333,6 +336,10 @@ class Scenario:
             for step in self.steps:
                 if not step.enabled:
                     continue
+
+                # 步骤前回调（如限速）
+                if pre_step_callback:
+                    pre_step_callback(step)
 
                 step_result = step.execute(context, http_executor, self.default_headers)
                 result.steps.append(step_result)

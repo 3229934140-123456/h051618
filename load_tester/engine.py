@@ -144,6 +144,9 @@ class LoadTestResult:
     end_time: float = 0.0
     duration: float = 0.0
     stopped_early: bool = False
+    # 参数使用统计（CSV、计数器等）
+    parameter_stats: List[Dict[str, Any]] = field(default_factory=list)
+    csv_stats: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def success(self) -> bool:
@@ -402,6 +405,18 @@ class LoadTestEngine:
             for kind, path in report_paths.items():
                 print(f"   [{kind.upper()}] {path}")
 
+        # 收集参数使用统计
+        parameter_stats = []
+        csv_stats = []
+        if self._worker_pool is not None:
+            try:
+                parameter_stats = self._worker_pool.get_parameter_stats()
+                csv_stats = self._worker_pool.get_csv_stats_summary()
+            except Exception:
+                pass
+        metrics.parameter_stats = parameter_stats
+        metrics.csv_stats = csv_stats
+
         result = LoadTestResult(
             config=config,
             metrics=metrics,
@@ -410,6 +425,8 @@ class LoadTestEngine:
             end_time=self._end_time,
             duration=self._end_time - self._start_time,
             stopped_early=self._stopped_early,
+            parameter_stats=parameter_stats,
+            csv_stats=csv_stats,
         )
         return result
 

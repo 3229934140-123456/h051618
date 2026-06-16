@@ -216,6 +216,71 @@ def _cmd_list(args) -> int:
     return 0
 
 
+def _cmd_preview(args) -> int:
+    """预览场景前N轮的请求详情"""
+    script_path = Path(args.script)
+    try:
+        scenario = _load_scenario_from_file(script_path)
+    except Exception as e:
+        print(f"❌ 加载场景失败: {e}", file=sys.stderr)
+        return 1
+
+    iterations = args.iterations
+    print(f"\n🎬 场景预览: {scenario.name}")
+    if scenario.base_url:
+        print(f"   Base URL: {scenario.base_url}")
+    print(f"   预览 {iterations} 轮迭代的请求详情\n")
+
+    # 使用独立参数集（和真实运行一致）
+    params = scenario.parameters.clone()
+
+    for i in range(1, iterations + 1):
+        # 生成这轮的参数
+        vars_dict = params.generate()
+        context = scenario.create_context(user_id=f"preview-user-{i}")
+        context.update(vars_dict)
+
+        print(f"{'='*70}")
+        print(f"  第 {i} 轮迭代 (Iteration {i})")
+        print(f"{'='*70}")
+
+        for j, step in enumerate(scenario.steps, 1):
+            if not step.enabled:
+                print(f"\n  ▶ Step {j}: {step.name}  [跳过]")
+                continue
+
+            # 调用 request.execute 获得展开后的请求
+            request_result = step.request.execute(context.variables, scenario.default_headers)
+
+            print(f"\n  ▶ Step {j}: {step.name}")
+            print(f"    请求名: {request_result.request_name}")
+            print(f"    方法:   {request_result.method}")
+            print(f"    URL:    {request_result.url}")
+
+            if request_result.headers:
+                print(f"    Headers:")
+                for k, v in request_result.headers.items():
+                    print(f"      {k}: {v}")
+            else:
+                print(f"    Headers: (无)")
+
+            if request_result.body is not None:
+                body_str = str(request_result.body)
+                if len(body_str) > 500:
+                    body_str = body_str[:500] + "..."
+                print(f"    Body:   {body_str}")
+            else:
+                print(f"    Body:   (无)")
+
+            if step.think_time:
+                print(f"    Think:  {step.think_time}s")
+
+        print()
+
+    print(f"\n✅ 预览完成，共 {iterations} 轮，每轮 {len([s for s in scenario.steps if s.enabled])} 个请求\n")
+    return 0
+
+
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("script", help="场景定义Python脚本路径")
     parser.add_argument("-v", "--verbose", action="store_true", help="详细输出")
@@ -301,6 +366,12 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list", help="列出场景中的步骤和参数")
     _add_common_arguments(list_parser)
 
+    # preview 命令
+    preview_parser = subparsers.add_parser("preview", help="预览前N轮请求（展开参数，不实际发送）")
+    _add_common_arguments(preview_parser)
+    preview_parser.add_argument("-n", "--iterations", type=int, default=3,
+                                help="预览迭代轮数 (默认: 3)")
+
     return parser
 
 
@@ -313,6 +384,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_run(args)
     elif args.command == "list":
         return _cmd_list(args)
+    elif args.command == "preview":
+        return _cmd_preview(args)
     else:
         parser.print_help()
         return 0

@@ -1,0 +1,11 @@
+category,product_id,quantity,payment_method
+electronics,1001,1,credit_card
+electronics,1002,2,credit_card
+clothing,2001,1,paypal
+clothing,2002,3,credit_card
+home,3001,1,paypal
+home,3002,2,credit_card
+books,4001,1,credit_card
+books,4002,1,paypal
+sports,5001,2,credit_card
+sports,5002,1,paypal

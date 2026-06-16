@@ -1,0 +1,15 @@
+=== 调试信息 ===
+Total requests (throughput): 61
+by_step keys: ['step_a', 'step_b', 'step_c']
+  step_a: total=21, qps=4.12
+  step_b: total=20, qps=3.93
+  step_c: total=20, qps=3.93
+
+by_name keys: ['step_a', 'step_b', 'step_c']
+  step_a: count=21
+  step_b: count=20
+  step_c: count=20
+
+Scenario metrics:
+  total_iterations: 21
+  success_iterations: 20
