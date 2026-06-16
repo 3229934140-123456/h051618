@@ -111,17 +111,41 @@ class ErrorMetrics:
 
 
 @dataclass
+class ScenarioMetrics:
+    """场景级统计指标（独立于HTTP请求统计）"""
+    total_iterations: int = 0
+    success_iterations: int = 0
+    failed_iterations: int = 0
+    duration_seconds: float = 0.0
+    latency: PercentileMetrics = field(default_factory=PercentileMetrics)
+    by_scenario: Dict[str, PercentileMetrics] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "total_iterations": self.total_iterations,
+            "success_iterations": self.success_iterations,
+            "failed_iterations": self.failed_iterations,
+            "duration_seconds": round(self.duration_seconds, 2),
+            "latency": self.latency.to_dict(),
+            "by_scenario": {k: v.to_dict() for k, v in self.by_scenario.items()},
+        }
+
+
+@dataclass
 class AggregatedMetrics:
     """综合聚合指标"""
     start_time: float = 0.0
     end_time: float = 0.0
     duration_seconds: float = 0.0
+    # HTTP 请求口径统计
     overall: PercentileMetrics = field(default_factory=PercentileMetrics)
     throughput: ThroughputMetrics = field(default_factory=ThroughputMetrics)
     errors: ErrorMetrics = field(default_factory=ErrorMetrics)
     by_name: Dict[str, PercentileMetrics] = field(default_factory=dict)
     by_status: Dict[str, int] = field(default_factory=dict)
     histogram_snapshot: Optional[HistogramSnapshot] = None
+    # 场景口径统计（独立）
+    scenario: ScenarioMetrics = field(default_factory=ScenarioMetrics)
 
     def to_dict(self) -> dict:
         return {
@@ -133,6 +157,7 @@ class AggregatedMetrics:
             "errors": self.errors.to_dict(),
             "by_name": {k: v.to_dict() for k, v in self.by_name.items()},
             "by_status": {k.value if hasattr(k, "value") else k: v for k, v in self.by_status.items()},
+            "scenario": self.scenario.to_dict(),
         }
 
 
@@ -174,18 +199,31 @@ class MetricsAggregator(MetricsSink):
         # 按名称分组的直方图
         self._name_histograms: Dict[str, HdrHistogram] = {}
 
-        # 计数
+        # 场景级直方图（单独统计）
+        self._scenario_histogram = HdrHistogram(
+            lowest_value_ns=histogram_lowest_ns,
+            highest_value_ns=histogram_highest_ns,
+            significant_digits=histogram_sig_digits,
+        )
+        self._scenario_name_histograms: Dict[str, HdrHistogram] = {}
+
+        # HTTP 请求计数（REQUEST / STEP 类型）
         self._total_count = 0
         self._success_count = 0
         self._failure_count = 0
 
-        # 状态分布
+        # 场景级计数（SCENARIO 类型，单独统计）
+        self._scenario_total_count = 0
+        self._scenario_success_count = 0
+        self._scenario_failure_count = 0
+
+        # 状态分布（仅HTTP请求）
         self._status_counts: Dict[SampleStatus, int] = defaultdict(int)
         self._status_codes: Dict[int, int] = defaultdict(int)
         self._error_types: Dict[str, int] = defaultdict(int)
         self._error_messages: Dict[str, int] = defaultdict(int)
 
-        # 时间分桶
+        # 时间分桶 - HTTP 请求（用于 QPS 时序）
         self._bucket_size = time_bucket_seconds
         self._keep_buckets = keep_time_buckets
         self._time_buckets: Deque[Tuple[float, int, int]] = deque(maxlen=keep_time_buckets)
@@ -214,7 +252,11 @@ class MetricsAggregator(MetricsSink):
 
     # ============ 核心记录逻辑 ============
     def _record_sample(self, sample: Sample) -> None:
-        """记录单个样本（已加锁）"""
+        """记录单个样本（已加锁）
+        按 SampleType 区分统计：
+        - REQUEST / STEP: 计入 HTTP 请求口径统计（总请求数、QPS、延迟等）
+        - SCENARIO: 计入场景级统计（迭代次数、场景耗时等）
+        """
         # 1. 时间范围
         ts = sample.timestamp
         if self._first_ts is None or ts < self._first_ts:
@@ -222,61 +264,80 @@ class MetricsAggregator(MetricsSink):
         if self._last_ts is None or ts > self._last_ts:
             self._last_ts = ts
 
-        # 2. 延迟转换为纳秒
         latency_ns = int(sample.latency * 1_000_000_000)
-        # 3. 全局直方图
-        self._histogram.record_value(latency_ns)
-
-        # 4. 按名称分组直方图
         name = sample.name or "unknown"
-        if name not in self._name_histograms:
-            self._name_histograms[name] = HdrHistogram(
-                lowest_value_ns=self._hist_lo,
-                highest_value_ns=self._hist_hi,
-                significant_digits=self._sig_digits,
-            )
-        self._name_histograms[name].record_value(latency_ns)
 
-        # 5. 计数
-        self._total_count += 1
-        if sample.is_success:
-            self._success_count += 1
-        else:
-            self._failure_count += 1
+        if sample.sample_type in (SampleType.REQUEST, SampleType.STEP):
+            # ========== HTTP 请求口径统计 ==========
+            # 全局直方图
+            self._histogram.record_value(latency_ns)
 
-        # 6. 状态分布
-        self._status_counts[sample.status] += 1
-        if sample.status_code:
-            self._status_codes[sample.status_code] += 1
+            # 按名称分组直方图
+            if name not in self._name_histograms:
+                self._name_histograms[name] = HdrHistogram(
+                    lowest_value_ns=self._hist_lo,
+                    highest_value_ns=self._hist_hi,
+                    significant_digits=self._sig_digits,
+                )
+            self._name_histograms[name].record_value(latency_ns)
 
-        # 7. 错误统计
-        if sample.is_error:
-            self._error_types[sample.status.value] += 1
-            if sample.error_message:
-                # 截断过长的错误信息
-                key = sample.error_message[:200]
-                self._error_messages[key] += 1
+            # 计数
+            self._total_count += 1
+            if sample.is_success:
+                self._success_count += 1
+            else:
+                self._failure_count += 1
 
-        # 8. 时间分桶（QPS 计算）
-        bucket_ts = math.floor(ts / self._bucket_size) * self._bucket_size
-        if self._current_bucket_ts is None:
-            self._current_bucket_ts = bucket_ts
-            self._current_bucket_total = 0
-            self._current_bucket_success = 0
-        elif bucket_ts != self._current_bucket_ts:
-            # 上一个桶结束，入队
-            self._time_buckets.append((
-                self._current_bucket_ts,
-                self._current_bucket_total,
-                self._current_bucket_success,
-            ))
-            self._current_bucket_ts = bucket_ts
-            self._current_bucket_total = 0
-            self._current_bucket_success = 0
+            # 状态分布
+            self._status_counts[sample.status] += 1
+            if sample.status_code:
+                self._status_codes[sample.status_code] += 1
 
-        self._current_bucket_total += 1
-        if sample.is_success:
-            self._current_bucket_success += 1
+            # 错误统计
+            if sample.is_error:
+                self._error_types[sample.status.value] += 1
+                if sample.error_message:
+                    key = sample.error_message[:200]
+                    self._error_messages[key] += 1
+
+            # 时间分桶（QPS 计算）- 仅 HTTP 请求
+            bucket_ts = math.floor(ts / self._bucket_size) * self._bucket_size
+            if self._current_bucket_ts is None:
+                self._current_bucket_ts = bucket_ts
+                self._current_bucket_total = 0
+                self._current_bucket_success = 0
+            elif bucket_ts != self._current_bucket_ts:
+                # 上一个桶结束，入队
+                self._time_buckets.append((
+                    self._current_bucket_ts,
+                    self._current_bucket_total,
+                    self._current_bucket_success,
+                ))
+                self._current_bucket_ts = bucket_ts
+                self._current_bucket_total = 0
+                self._current_bucket_success = 0
+
+            self._current_bucket_total += 1
+            if sample.is_success:
+                self._current_bucket_success += 1
+
+        elif sample.sample_type == SampleType.SCENARIO:
+            # ========== 场景级统计 ==========
+            self._scenario_histogram.record_value(latency_ns)
+
+            if name not in self._scenario_name_histograms:
+                self._scenario_name_histograms[name] = HdrHistogram(
+                    lowest_value_ns=self._hist_lo,
+                    highest_value_ns=self._hist_hi,
+                    significant_digits=self._sig_digits,
+                )
+            self._scenario_name_histograms[name].record_value(latency_ns)
+
+            self._scenario_total_count += 1
+            if sample.is_success:
+                self._scenario_success_count += 1
+            else:
+                self._scenario_failure_count += 1
 
     # ============ 结果输出 ============
     def build(self) -> AggregatedMetrics:
@@ -295,16 +356,16 @@ class MetricsAggregator(MetricsSink):
             end = self._last_ts or now
             duration = max(0.001, end - start)
 
-            # 1. 整体延迟
+            # 1. HTTP 请求整体延迟
             overall = self._histogram_to_percentile_metrics(self._histogram)
 
-            # 2. 吞吐量
+            # 2. HTTP 请求吞吐量（QPS时间线去重）
             throughput = self._build_throughput(duration)
 
-            # 3. 错误
+            # 3. HTTP 请求错误统计
             errors = self._build_errors()
 
-            # 4. 按名称分组
+            # 4. HTTP 请求按名称分组
             by_name = {
                 name: self._histogram_to_percentile_metrics(hist)
                 for name, hist in self._name_histograms.items()
@@ -312,6 +373,9 @@ class MetricsAggregator(MetricsSink):
 
             # 5. 状态分布（转普通dict）
             by_status = {k.value: v for k, v in self._status_counts.items()}
+
+            # 6. 场景级统计（独立）
+            scenario_metrics = self._build_scenario_metrics(duration)
 
             metrics = AggregatedMetrics(
                 start_time=start,
@@ -323,6 +387,7 @@ class MetricsAggregator(MetricsSink):
                 by_name=by_name,
                 by_status=by_status,
                 histogram_snapshot=self._histogram.snapshot(),
+                scenario=scenario_metrics,
             )
 
             # 弹出刚才入队的当前桶
@@ -331,6 +396,48 @@ class MetricsAggregator(MetricsSink):
                     self._time_buckets.pop()
 
             return metrics
+
+    def _build_throughput(self, duration: float) -> ThroughputMetrics:
+        t = ThroughputMetrics()
+        t.total_requests = self._total_count
+        t.total_success = self._success_count
+        t.total_failures = self._failure_count
+        t.duration_seconds = duration
+        t.overall_qps = self._total_count / duration if duration > 0 else 0
+        t.success_qps = self._success_count / duration if duration > 0 else 0
+        t.failure_qps = self._failure_count / duration if duration > 0 else 0
+
+        # QPS 时间线：使用 dict 按时间戳去重，确保同一秒只保留一条数据
+        qps_by_ts: Dict[float, float] = {}
+
+        peak = 0.0
+        for bucket_ts, total, _success in self._time_buckets:
+            qps = total / self._bucket_size
+            if qps > peak:
+                peak = qps
+            # 同秒覆盖，保证唯一
+            qps_by_ts[bucket_ts] = qps
+
+        # 当前桶也算（但检查是否已存在，避免重复最后一个时间点）
+        if self._current_bucket_ts is not None and self._current_bucket_total > 0:
+            qps = self._current_bucket_total / self._bucket_size
+            if qps > peak:
+                peak = qps
+            # 只有当前桶时间戳不在已有的时间桶中时才添加
+            # （build() 中会把当前桶临时入队，所以这里可能重复）
+            if self._current_bucket_ts not in qps_by_ts:
+                qps_by_ts[self._current_bucket_ts] = qps
+            else:
+                # 已存在则取较大值（当前桶数据可能更新）
+                if qps > qps_by_ts[self._current_bucket_ts]:
+                    qps_by_ts[self._current_bucket_ts] = qps
+
+        # 转换为有序列表
+        qps_series = sorted(qps_by_ts.items(), key=lambda x: x[0])
+
+        t.peak_qps = peak
+        t.qps_series = qps_series
+        return t
 
     def _histogram_to_percentile_metrics(self, hist: HdrHistogram) -> PercentileMetrics:
         """将直方图转换为 PercentileMetrics"""
@@ -356,34 +463,19 @@ class MetricsAggregator(MetricsSink):
         m.p9999_ms = pcts.get("p99.99", 0) * ns_to_ms
         return m
 
-    def _build_throughput(self, duration: float) -> ThroughputMetrics:
-        t = ThroughputMetrics()
-        t.total_requests = self._total_count
-        t.total_success = self._success_count
-        t.total_failures = self._failure_count
-        t.duration_seconds = duration
-        t.overall_qps = self._total_count / duration if duration > 0 else 0
-        t.success_qps = self._success_count / duration if duration > 0 else 0
-        t.failure_qps = self._failure_count / duration if duration > 0 else 0
-
-        # 计算峰值QPS和时序
-        peak = 0.0
-        qps_series: List[Tuple[float, float]] = []
-        for bucket_ts, total, _success in self._time_buckets:
-            qps = total / self._bucket_size
-            if qps > peak:
-                peak = qps
-            qps_series.append((bucket_ts, qps))
-        # 当前桶也算
-        if self._current_bucket_ts is not None and self._current_bucket_total > 0:
-            qps = self._current_bucket_total / self._bucket_size
-            if qps > peak:
-                peak = qps
-            qps_series.append((self._current_bucket_ts, qps))
-
-        t.peak_qps = peak
-        t.qps_series = qps_series
-        return t
+    def _build_scenario_metrics(self, duration: float) -> ScenarioMetrics:
+        """构建场景级统计"""
+        sm = ScenarioMetrics()
+        sm.total_iterations = self._scenario_total_count
+        sm.success_iterations = self._scenario_success_count
+        sm.failed_iterations = self._scenario_failure_count
+        sm.duration_seconds = duration
+        sm.latency = self._histogram_to_percentile_metrics(self._scenario_histogram)
+        sm.by_scenario = {
+            name: self._histogram_to_percentile_metrics(hist)
+            for name, hist in self._scenario_name_histograms.items()
+        }
+        return sm
 
     def _build_errors(self) -> ErrorMetrics:
         e = ErrorMetrics()
@@ -458,9 +550,14 @@ class MetricsAggregator(MetricsSink):
         with self._lock:
             self._histogram.reset()
             self._name_histograms.clear()
+            self._scenario_histogram.reset()
+            self._scenario_name_histograms.clear()
             self._total_count = 0
             self._success_count = 0
             self._failure_count = 0
+            self._scenario_total_count = 0
+            self._scenario_success_count = 0
+            self._scenario_failure_count = 0
             self._status_counts.clear()
             self._status_codes.clear()
             self._error_types.clear()

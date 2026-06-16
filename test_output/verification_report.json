@@ -1,0 +1,417 @@
+{
+  "meta": {
+    "title": "验证测试报告",
+    "generated_at": 1781630343.345646,
+    "generated_at_datetime": "2026-06-17T01:19:03.345646",
+    "generator": "load_tester",
+    "version": "1.0.0"
+  },
+  "summary": {
+    "total_requests": 133,
+    "successful_requests": 131,
+    "failed_requests": 2,
+    "success_rate": 0.984962,
+    "error_rate": 0.015038,
+    "duration_seconds": 12.22,
+    "start_timestamp": 1781630330.329447,
+    "end_timestamp": 1781630342.5493774,
+    "start_datetime": "2026-06-17T01:18:50.329447",
+    "end_datetime": "2026-06-17T01:19:02.549377"
+  },
+  "latency": {
+    "mean_ms": 184.173,
+    "min_ms": 25.654,
+    "max_ms": 998.145,
+    "stddev_ms": 129.245,
+    "p50_ms": 189.006,
+    "p75_ms": 212.861,
+    "p90_ms": 302.514,
+    "p95_ms": 403.177,
+    "p99_ms": 593.494,
+    "p999_ms": 997.196,
+    "p9999_ms": 997.196,
+    "sample_count": 133
+  },
+  "throughput": {
+    "overall_qps": 10.88,
+    "success_qps": 10.72,
+    "failure_qps": 0.16,
+    "peak_qps": 15.0,
+    "duration_seconds": 12.22,
+    "qps_timeseries": [
+      {
+        "timestamp": 1781630330,
+        "qps": 15.0
+      },
+      {
+        "timestamp": 1781630331,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630332,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630333,
+        "qps": 12.0
+      },
+      {
+        "timestamp": 1781630334,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630335,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630336,
+        "qps": 12.0
+      },
+      {
+        "timestamp": 1781630337,
+        "qps": 12.0
+      },
+      {
+        "timestamp": 1781630338,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630339,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630340,
+        "qps": 9.0
+      },
+      {
+        "timestamp": 1781630341,
+        "qps": 12.0
+      },
+      {
+        "timestamp": 1781630342,
+        "qps": 7.0
+      }
+    ]
+  },
+  "errors": {
+    "total": 2,
+    "rate": 0.015038,
+    "by_status_code": {
+      "200": 131
+    },
+    "by_error_type": {
+      "error": 2
+    },
+    "top_errors": [
+      {
+        "message": "Load test stopped",
+        "count": 2,
+        "percent": 1.5038
+      }
+    ]
+  },
+  "by_name": {
+    "步骤1_商品列表": {
+      "count": 45,
+      "min_ms": 25.654,
+      "max_ms": 403.602,
+      "mean_ms": 161.879,
+      "stddev_ms": 86.597,
+      "p50_ms": 191.889,
+      "p75_ms": 207.618,
+      "p90_ms": 288.883,
+      "p95_ms": 293.601,
+      "p99_ms": 403.177,
+      "p99.9_ms": 403.177,
+      "p99.99_ms": 403.177
+    },
+    "步骤2_商品详情": {
+      "count": 44,
+      "min_ms": 25.84,
+      "max_ms": 998.145,
+      "mean_ms": 205.687,
+      "stddev_ms": 180.095,
+      "p50_ms": 112.329,
+      "p75_ms": 295.698,
+      "p90_ms": 406.847,
+      "p95_ms": 509.608,
+      "p99_ms": 997.196,
+      "p99.9_ms": 997.196,
+      "p99.99_ms": 997.196
+    },
+    "步骤3_加入购物车": {
+      "count": 44,
+      "min_ms": 26.874,
+      "max_ms": 497.634,
+      "mean_ms": 185.46,
+      "stddev_ms": 97.045,
+      "p50_ms": 198.443,
+      "p75_ms": 217.055,
+      "p90_ms": 302.514,
+      "p95_ms": 307.757,
+      "p99_ms": 497.549,
+      "p99.9_ms": 497.549,
+      "p99.99_ms": 497.549
+    }
+  },
+  "by_status": {
+    "success": 131,
+    "error": 2
+  },
+  "scenario": {
+    "total_iterations": 45,
+    "success_iterations": 43,
+    "failed_iterations": 2,
+    "success_rate": 0.955556,
+    "duration_seconds": 12.22,
+    "latency": {
+      "count": 45,
+      "min_ms": 80.395,
+      "max_ms": 1298.613,
+      "mean_ms": 544.367,
+      "stddev_ms": 253.898,
+      "p50_ms": 505.414,
+      "p75_ms": 610.271,
+      "p90_ms": 897.581,
+      "p95_ms": 997.196,
+      "p99_ms": 1298.137,
+      "p99.9_ms": 1298.137,
+      "p99.99_ms": 1298.137
+    },
+    "by_scenario": {
+      "3步验证场景": {
+        "count": 45,
+        "min_ms": 80.395,
+        "max_ms": 1298.613,
+        "mean_ms": 544.367,
+        "stddev_ms": 253.898,
+        "p50_ms": 505.414,
+        "p75_ms": 610.271,
+        "p90_ms": 897.581,
+        "p95_ms": 997.196,
+        "p99_ms": 1298.137,
+        "p99.9_ms": 1298.137,
+        "p99.99_ms": 1298.137
+      }
+    }
+  },
+  "histogram": {
+    "total_count": 133,
+    "min_ns": 25653700.0,
+    "max_ns": 998145200.0,
+    "mean_ns": 184173107.7293233,
+    "stddev_ns": 129245348.50863637,
+    "percentiles_ns": {
+      "p50": 189005824.0,
+      "p75": 212860928.0,
+      "p90": 302514176.0,
+      "p95": 403177472.0,
+      "p99": 593494016.0,
+      "p99.9": 997195776.0,
+      "p99.99": 997195776.0,
+      "p100": 998145200.0
+    },
+    "buckets": [
+      {
+        "start_ns": 25653700.0,
+        "count": 11
+      },
+      {
+        "start_ns": 45103530.0,
+        "count": 1
+      },
+      {
+        "start_ns": 64553360.0,
+        "count": 1
+      },
+      {
+        "start_ns": 84003190.0,
+        "count": 31
+      },
+      {
+        "start_ns": 103453020.0,
+        "count": 17
+      },
+      {
+        "start_ns": 122902850.0,
+        "count": 0
+      },
+      {
+        "start_ns": 142352680.0,
+        "count": 0
+      },
+      {
+        "start_ns": 161802510.0,
+        "count": 2
+      },
+      {
+        "start_ns": 181252340.0,
+        "count": 15
+      },
+      {
+        "start_ns": 200702170.0,
+        "count": 26
+      },
+      {
+        "start_ns": 220152000.0,
+        "count": 0
+      },
+      {
+        "start_ns": 239601830.0,
+        "count": 0
+      },
+      {
+        "start_ns": 259051660.0,
+        "count": 1
+      },
+      {
+        "start_ns": 278501490.0,
+        "count": 12
+      },
+      {
+        "start_ns": 297951320.0,
+        "count": 7
+      },
+      {
+        "start_ns": 317401150.0,
+        "count": 0
+      },
+      {
+        "start_ns": 336850980.0,
+        "count": 0
+      },
+      {
+        "start_ns": 356300810.0,
+        "count": 0
+      },
+      {
+        "start_ns": 375750640.0,
+        "count": 1
+      },
+      {
+        "start_ns": 395200470.0,
+        "count": 3
+      },
+      {
+        "start_ns": 414650300.0,
+        "count": 0
+      },
+      {
+        "start_ns": 434100130.0,
+        "count": 0
+      },
+      {
+        "start_ns": 453549960.0,
+        "count": 0
+      },
+      {
+        "start_ns": 472999790.0,
+        "count": 0
+      },
+      {
+        "start_ns": 492449620.0,
+        "count": 3
+      },
+      {
+        "start_ns": 511899450.0,
+        "count": 0
+      },
+      {
+        "start_ns": 531349280.0,
+        "count": 0
+      },
+      {
+        "start_ns": 550799110.0,
+        "count": 0
+      },
+      {
+        "start_ns": 570248940.0,
+        "count": 0
+      },
+      {
+        "start_ns": 589698770.0,
+        "count": 1
+      },
+      {
+        "start_ns": 609148600.0,
+        "count": 0
+      },
+      {
+        "start_ns": 628598430.0,
+        "count": 0
+      },
+      {
+        "start_ns": 648048260.0,
+        "count": 0
+      },
+      {
+        "start_ns": 667498090.0,
+        "count": 0
+      },
+      {
+        "start_ns": 686947920.0,
+        "count": 0
+      },
+      {
+        "start_ns": 706397750.0,
+        "count": 0
+      },
+      {
+        "start_ns": 725847580.0,
+        "count": 0
+      },
+      {
+        "start_ns": 745297410.0,
+        "count": 0
+      },
+      {
+        "start_ns": 764747240.0,
+        "count": 0
+      },
+      {
+        "start_ns": 784197070.0,
+        "count": 0
+      },
+      {
+        "start_ns": 803646900.0,
+        "count": 0
+      },
+      {
+        "start_ns": 823096730.0,
+        "count": 0
+      },
+      {
+        "start_ns": 842546560.0,
+        "count": 0
+      },
+      {
+        "start_ns": 861996390.0,
+        "count": 0
+      },
+      {
+        "start_ns": 881446220.0,
+        "count": 0
+      },
+      {
+        "start_ns": 900896050.0,
+        "count": 0
+      },
+      {
+        "start_ns": 920345880.0,
+        "count": 0
+      },
+      {
+        "start_ns": 939795710.0,
+        "count": 0
+      },
+      {
+        "start_ns": 959245540.0,
+        "count": 0
+      },
+      {
+        "start_ns": 978695370.0,
+        "count": 1
+      }
+    ]
+  }
+}

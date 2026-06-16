@@ -176,22 +176,50 @@ class Worker:
     def _run(self) -> None:
         """Worker 主循环"""
         try:
-            while not self._should_stop():
-                # 速率限制：每次场景迭代消耗1个令牌
-                if self.rate_limiter is not None:
+            # 包装 http_executor，在每个HTTP请求前获取令牌（按请求限速）
+            original_executor = self.http_executor
+            rate_limiter = self.rate_limiter
+
+            def rate_limited_executor(request_result):
+                if rate_limiter is not None and not self._should_stop():
                     try:
-                        self.rate_limiter.acquire(1)
+                        rate_limiter.acquire(1)
                     except Exception:
                         pass
+                if self._should_stop():
+                    # 已停止，返回空响应
+                    import time as _t
+                    from ..scenario.request import ResponseData
+                    return ResponseData(
+                        status_code=0,
+                        headers={},
+                        body=None,
+                        latency=0,
+                        timestamp=_t.time(),
+                        error="Load test stopped",
+                    )
+                return original_executor(request_result)
+
+            effective_executor = rate_limited_executor
+
+            while not self._should_stop():
+                # 每次迭代前重新生成参数
+                if self._context is not None:
+                    # 重置所有参数，重新生成随机值
+                    self.scenario.parameters.reset()
+                    new_params = self.scenario.parameters.generate()
+                    # 保留已提取的变量（如token、user_id等），但参数化的值重新生成
+                    for k, v in new_params.items():
+                        self._context.variables[k] = v
 
                 if self._should_stop():
                     break
 
-                # 执行一次场景迭代
+                # 执行一次场景迭代（限速已在http_executor中按请求处理）
                 try:
                     scenario_result = self.scenario.run_iteration(
                         context=self._context,
-                        http_executor=self.http_executor,
+                        http_executor=effective_executor,
                     )
 
                     self._iterations_completed += 1

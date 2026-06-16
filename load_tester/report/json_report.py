@@ -138,6 +138,24 @@ class JsonReporter:
         # 状态分布
         by_status = m.by_status
 
+        # 场景级统计
+        scenario = None
+        if m.scenario and m.scenario.total_iterations > 0:
+            scenario = {
+                "total_iterations": m.scenario.total_iterations,
+                "success_iterations": m.scenario.success_iterations,
+                "failed_iterations": m.scenario.failed_iterations,
+                "success_rate": round(
+                    m.scenario.success_iterations / m.scenario.total_iterations, 6
+                ) if m.scenario.total_iterations > 0 else 1.0,
+                "duration_seconds": round(m.scenario.duration_seconds, 2),
+                "latency": m.scenario.latency.to_dict(),
+                "by_scenario": {
+                    name: lat.to_dict()
+                    for name, lat in m.scenario.by_scenario.items()
+                },
+            }
+
         # 直方图
         histogram = None
         if self._include_histogram and m.histogram_snapshot:
@@ -172,6 +190,8 @@ class JsonReporter:
             "by_name": by_name,
             "by_status": by_status,
         }
+        if scenario:
+            report["scenario"] = scenario
         if histogram:
             report["histogram"] = histogram
 

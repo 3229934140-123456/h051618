@@ -61,6 +61,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
   {errors_section}
 
+  {scenario_section}
+
   <section class="section">
     <h2>📋 请求明细</h2>
     <div class="table-wrap">
@@ -215,6 +217,9 @@ class HtmlReporter:
         # 状态分布
         status_section = self._status_section(m)
 
+        # 场景级统计
+        scenario_section = self._scenario_section(m)
+
         generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         return _HTML_TEMPLATE.format(
@@ -228,6 +233,7 @@ class HtmlReporter:
             errors_section=errors_section,
             by_name_table=by_name_table,
             status_section=status_section,
+            scenario_section=scenario_section,
         )
 
     def _card(self, label: str, value: str, sub: str = "", color: str = "") -> str:
@@ -253,6 +259,17 @@ class HtmlReporter:
             self._card("P50延迟", f"{m.overall.p50_ms:.2f}ms", f"平均: {m.overall.mean_ms:.2f}ms", "cyan"),
             self._card("P99延迟", f"{m.overall.p99_ms:.2f}ms", f"最大: {m.overall.max_ms:.2f}ms", "amber"),
         ]
+
+        # 添加场景迭代统计卡片
+        if m.scenario and m.scenario.total_iterations > 0:
+            sc = m.scenario
+            scene_sr = sc.success_iterations / sc.total_iterations if sc.total_iterations else 1.0
+            scene_sr_color = "green" if scene_sr >= 0.99 else ("amber" if scene_sr >= 0.95 else "red")
+            cards.extend([
+                self._card("场景迭代", f"{sc.total_iterations:,}", f"迭代耗时 P50: {sc.latency.p50_ms:.2f}ms", "indigo"),
+                self._card("迭代成功率", f"{scene_sr*100:.2f}%", f"{sc.success_iterations:,} 成功", scene_sr_color),
+            ])
+
         return "\n".join(cards)
 
     def _build_latency_histogram(self, m: AggregatedMetrics) -> str:
@@ -517,3 +534,52 @@ class HtmlReporter:
   <h2>📊 请求状态分布</h2>
   {"".join(rows)}
 </section>"""
+
+    def _scenario_section(self, m: AggregatedMetrics) -> str:
+        """场景级统计 section"""
+        if not m.scenario or m.scenario.total_iterations == 0:
+            return ""
+
+        sc = m.scenario
+        html = ['<section class="section"><h2>🔄 场景迭代统计</h2>']
+        html.append('<div class="table-wrap"><table><thead><tr><th>场景名称</th><th>迭代总数</th><th>成功</th><th>失败</th><th>成功率</th>')
+        html.append('<th>Min(ms)</th><th>P50(ms)</th><th>P95(ms)</th><th>P99(ms)</th><th>Max(ms)</th><th>Mean(ms)</th></tr></thead><tbody>')
+
+        # 总体场景统计
+        total_sr = sc.success_iterations / sc.total_iterations if sc.total_iterations else 1.0
+        cls = "good" if total_sr >= 0.99 else ("warn" if total_sr >= 0.95 else "bad")
+        html.append(
+            f"<tr><td style='text-align:left;font-weight:600;'>[整体]</td>"
+            f"<td>{sc.total_iterations:,}</td>"
+            f"<td>{sc.success_iterations:,}</td>"
+            f"<td>{sc.failed_iterations:,}</td>"
+            f'<td class="{cls}">{total_sr*100:.4f}%</td>'
+            f"<td>{sc.latency.min_ms:.2f}</td>"
+            f"<td>{sc.latency.p50_ms:.2f}</td>"
+            f"<td>{sc.latency.p95_ms:.2f}</td>"
+            f"<td>{sc.latency.p99_ms:.2f}</td>"
+            f"<td>{sc.latency.max_ms:.2f}</td>"
+            f"<td>{sc.latency.mean_ms:.2f}</td></tr>"
+        )
+
+        # 按场景分组统计
+        for name, lat in sorted(sc.by_scenario.items(), key=lambda x: -x[1].count):
+            scene_total = lat.count
+            # 这个场景的成功率（近似，用场景级统计）
+            scene_sr = sc.success_iterations / max(1, sc.total_iterations)
+            cls = "good" if scene_sr >= 0.99 else ("warn" if scene_sr >= 0.95 else "bad")
+            html.append(
+                f"<tr><td style='text-align:left;padding-left:24px;'>{name}</td>"
+                f"<td>{lat.count:,}</td>"
+                f"<td>-</td><td>-</td>"
+                f'<td class="{cls}">{scene_sr*100:.4f}%</td>'
+                f"<td>{lat.min_ms:.2f}</td>"
+                f"<td>{lat.p50_ms:.2f}</td>"
+                f"<td>{lat.p95_ms:.2f}</td>"
+                f"<td>{lat.p99_ms:.2f}</td>"
+                f"<td>{lat.max_ms:.2f}</td>"
+                f"<td>{lat.mean_ms:.2f}</td></tr>"
+            )
+
+        html.append('</tbody></table></div></section>')
+        return "".join(html)

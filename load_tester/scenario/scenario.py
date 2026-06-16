@@ -135,12 +135,14 @@ class ScenarioStep:
         self,
         context: "ScenarioContext",
         http_executor: Callable[[RequestResult], ResponseData],
+        default_headers: Optional[Dict[str, str]] = None,
     ) -> ScenarioStepResult:
         """执行单个步骤
 
         Args:
             context: 场景上下文
             http_executor: HTTP执行函数，接收RequestResult返回ResponseData
+            default_headers: 场景级别的默认请求头，步骤自定义头优先覆盖
 
         Returns:
             步骤执行结果
@@ -155,8 +157,8 @@ class ScenarioStep:
         )
 
         try:
-            # 1. 准备请求（解析模板变量）
-            request_result = self.request.execute(context.variables)
+            # 1. 准备请求（解析模板变量 + 合并默认头）
+            request_result = self.request.execute(context.variables, default_headers)
 
             # 2. 执行HTTP请求
             response = http_executor(request_result)
@@ -332,7 +334,7 @@ class Scenario:
                 if not step.enabled:
                     continue
 
-                step_result = step.execute(context, http_executor)
+                step_result = step.execute(context, http_executor, self.default_headers)
                 result.steps.append(step_result)
 
                 # 思考时间

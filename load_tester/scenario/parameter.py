@@ -42,7 +42,12 @@ class ParameterType(str, Enum):
 class Parameter:
     """参数基类"""
 
-    def __init__(self, name: str, param_type: ParameterType):
+    _auto_name_counter = 0
+
+    def __init__(self, name: Optional[str] = None, param_type: Optional[ParameterType] = None):
+        if name is None:
+            Parameter._auto_name_counter += 1
+            name = f"inline_param_{Parameter._auto_name_counter}"
         self.name = name
         self.type = param_type
 
@@ -58,9 +63,17 @@ class Parameter:
 class ConstantParameter(Parameter):
     """常量参数"""
 
-    def __init__(self, name: str, value: Any):
+    def __init__(self, *args, name: Optional[str] = None, value: Any = None, **kwargs):
         super().__init__(name, ParameterType.CONSTANT)
-        self.value = value
+        # 兼容两种调用方式: ConstantParameter("name", value) 或 ConstantParameter(value="val", name="n")
+        if len(args) == 2 and value is None:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.value = args[1]
+        elif len(args) == 1 and value is None:
+            # 只有一个位置参数，假设是 value，name 自动生成或从 keyword 来
+            self.value = args[0]
+        else:
+            self.value = value
 
     def next_value(self, context: dict) -> Any:
         return self.value
@@ -69,10 +82,20 @@ class ConstantParameter(Parameter):
 class RandomIntParameter(Parameter):
     """随机整数参数"""
 
-    def __init__(self, name: str, min_value: int, max_value: int, seed: Optional[int] = None):
+    def __init__(self, *args, name: Optional[str] = None, min_value: Optional[int] = None, max_value: Optional[int] = None, seed: Optional[int] = None, **kwargs):
         super().__init__(name, ParameterType.RANDOM_INT)
-        self.min_value = min_value
-        self.max_value = max_value
+        # 兼容: RandomIntParameter("name", 1, 100) 或 RandomIntParameter(min_value=1, max_value=100)
+        if len(args) >= 3:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.min_value = args[1]
+            self.max_value = args[2]
+        elif len(args) == 2:
+            # 两个位置参数，假设是 min, max
+            self.min_value = args[0]
+            self.max_value = args[1]
+        else:
+            self.min_value = min_value
+            self.max_value = max_value
         self._rng = random.Random(seed)
 
     def next_value(self, context: dict) -> Any:
@@ -84,15 +107,25 @@ class RandomFloatParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
-        min_value: float,
-        max_value: float,
+        *args,
+        name: Optional[str] = None,
+        min_value: Optional[float] = None,
+        max_value: Optional[float] = None,
         precision: int = 4,
         seed: Optional[int] = None,
+        **kwargs,
     ):
         super().__init__(name, ParameterType.RANDOM_FLOAT)
-        self.min_value = min_value
-        self.max_value = max_value
+        if len(args) >= 3:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.min_value = args[1]
+            self.max_value = args[2]
+        elif len(args) == 2:
+            self.min_value = args[0]
+            self.max_value = args[1]
+        else:
+            self.min_value = min_value
+            self.max_value = max_value
         self.precision = precision
         self._rng = random.Random(seed)
 
@@ -106,15 +139,20 @@ class RandomStringParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
+        *args,
+        name: Optional[str] = None,
         min_length: int = 8,
         max_length: int = 16,
         charset: str = string.ascii_letters + string.digits,
         prefix: str = "",
         suffix: str = "",
         seed: Optional[int] = None,
+        **kwargs,
     ):
         super().__init__(name, ParameterType.RANDOM_STRING)
+        if len(args) >= 1 and isinstance(args[0], str) and len(args) > 1:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            args = args[1:]
         self.min_length = min_length
         self.max_length = max_length
         self.charset = charset
@@ -133,13 +171,22 @@ class RandomChoiceParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
-        choices: List[Any],
+        *args,
+        name: Optional[str] = None,
+        choices: Optional[List[Any]] = None,
         weights: Optional[List[float]] = None,
         seed: Optional[int] = None,
+        **kwargs,
     ):
         super().__init__(name, ParameterType.RANDOM_CHOICE)
-        self.choices = choices
+        if len(args) >= 2:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.choices = args[1]
+        elif len(args) == 1:
+            # 一个位置参数，假设是 choices
+            self.choices = args[0]
+        else:
+            self.choices = choices
         self.weights = weights
         self._rng = random.Random(seed)
 
@@ -154,13 +201,21 @@ class SequenceParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
-        values: List[Any],
+        *args,
+        name: Optional[str] = None,
+        values: Optional[List[Any]] = None,
         loop: bool = True,
         per_worker: bool = True,
+        **kwargs,
     ):
         super().__init__(name, ParameterType.SEQUENCE)
-        self.values = values
+        if len(args) >= 2:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.values = args[1]
+        elif len(args) == 1:
+            self.values = args[0]
+        else:
+            self.values = values
         self.loop = loop
         self.per_worker = per_worker
         self._index = 0
@@ -186,9 +241,16 @@ class SequenceParameter(Parameter):
 class UuidParameter(Parameter):
     """UUID参数"""
 
-    def __init__(self, name: str, uuid_version: int = 4):
+    def __init__(self, *args, name: Optional[str] = None, uuid_version: int = 4, **kwargs):
         super().__init__(name, ParameterType.UUID)
-        self.uuid_version = uuid_version
+        if len(args) >= 1:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            if len(args) >= 2:
+                self.uuid_version = args[1]
+            else:
+                self.uuid_version = uuid_version
+        else:
+            self.uuid_version = uuid_version
 
     def next_value(self, context: dict) -> Any:
         if self.uuid_version == 1:
@@ -204,18 +266,27 @@ class CounterParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
+        *args,
+        name: Optional[str] = None,
         start: int = 0,
         step: int = 1,
         width: Optional[int] = None,
         pad_char: str = "0",
+        **kwargs,
     ):
         super().__init__(name, ParameterType.COUNTER)
-        self.start = start
+        if len(args) >= 1:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            if len(args) >= 2:
+                self.start = args[1]
+            else:
+                self.start = start
+        else:
+            self.start = start
         self.step = step
         self.width = width
         self.pad_char = pad_char
-        self._value = start
+        self._value = self.start
 
     def next_value(self, context: dict) -> Any:
         current = self._value
@@ -236,20 +307,29 @@ class CsvParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
-        csv_path: Union[str, Path],
+        *args,
+        name: Optional[str] = None,
+        csv_path: Optional[Union[str, Path]] = None,
         columns: Optional[List[str]] = None,
         loop: bool = True,
         delimiter: str = ",",
+        **kwargs,
     ):
         super().__init__(name, ParameterType.CSV)
-        self.csv_path = Path(csv_path)
+        if len(args) >= 2:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.csv_path = Path(args[1])
+        elif len(args) == 1:
+            self.csv_path = Path(args[0])
+        else:
+            self.csv_path = Path(csv_path) if csv_path else None
         self.columns = columns
         self.loop = loop
         self.delimiter = delimiter
         self._rows: List[Dict[str, Any]] = []
         self._index = 0
-        self._load_csv()
+        if self.csv_path:
+            self._load_csv()
 
     def _load_csv(self) -> None:
         with open(self.csv_path, "r", encoding="utf-8") as f:
@@ -282,13 +362,22 @@ class DatetimeParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
+        *args,
+        name: Optional[str] = None,
         format_str: str = "%Y-%m-%dT%H:%M:%S",
         offset_hours: float = 0,
         utc: bool = False,
+        **kwargs,
     ):
         super().__init__(name, ParameterType.DATETIME)
-        self.format_str = format_str
+        if len(args) >= 1:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            if len(args) >= 2:
+                self.format_str = args[1]
+            else:
+                self.format_str = format_str
+        else:
+            self.format_str = format_str
         self.offset_hours = offset_hours
         self.utc = utc
 
@@ -305,9 +394,16 @@ class DatetimeParameter(Parameter):
 class TimestampParameter(Parameter):
     """时间戳参数"""
 
-    def __init__(self, name: str, unit: str = "s", offset_seconds: float = 0):
+    def __init__(self, *args, name: Optional[str] = None, unit: str = "s", offset_seconds: float = 0, **kwargs):
         super().__init__(name, ParameterType.TIMESTAMP)
-        self.unit = unit
+        if len(args) >= 1:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            if len(args) >= 2:
+                self.unit = args[1]
+            else:
+                self.unit = unit
+        else:
+            self.unit = unit
         self.offset_seconds = offset_seconds
 
     def next_value(self, context: dict) -> Any:
@@ -328,12 +424,20 @@ class CustomParameter(Parameter):
 
     def __init__(
         self,
-        name: str,
-        generator: Callable[[dict], Any],
+        *args,
+        name: Optional[str] = None,
+        generator: Optional[Callable[[dict], Any]] = None,
         reset_func: Optional[Callable[[], None]] = None,
+        **kwargs,
     ):
         super().__init__(name, ParameterType.CUSTOM)
-        self.generator = generator
+        if len(args) >= 2:
+            self.name = args[0] if self.name.startswith("inline_param_") else self.name
+            self.generator = args[1]
+        elif len(args) == 1:
+            self.generator = args[0]
+        else:
+            self.generator = generator
         self.reset_func = reset_func
 
     def next_value(self, context: dict) -> Any:
