@@ -222,62 +222,215 @@ def _cmd_preview(args) -> int:
     try:
         scenario = _load_scenario_from_file(script_path)
     except Exception as e:
-        print(f"❌ 加载场景失败: {e}", file=sys.stderr)
+        print(f"  加载场景失败: {e}", file=sys.stderr)
         return 1
 
     iterations = args.iterations
-    print(f"\n🎬 场景预览: {scenario.name}")
+    num_workers = max(1, getattr(args, 'workers', 1))
+    show_params = getattr(args, 'show_params', True)
+
+    sep_w = 78
+    print(f"\n  场景预览: {scenario.name}")
     if scenario.base_url:
-        print(f"   Base URL: {scenario.base_url}")
-    print(f"   预览 {iterations} 轮迭代的请求详情\n")
+        print(f"  Base URL: {scenario.base_url}")
+    print(f"  Workers:  {num_workers}")
+    print(f"  预览:     每个 Worker 跑 {iterations} 轮迭代")
+    print(f"  步骤数:   {len([s for s in scenario.steps if s.enabled])}")
+    # 步骤权重信息
+    steps_with_qps = [(s.name, s.qps_limit) for s in scenario.steps if s.enabled and s.qps_limit]
+    steps_with_w = [(s.name, getattr(s, 'weight', None)) for s in scenario.steps if getattr(s, 'weight', None) is not None]
+    if steps_with_qps or steps_with_w:
+        print(f"  限速配置:")
+        for nm, qp in steps_with_qps:
+            print(f"    - {nm}: qps_limit={qp}")
+        for nm, w in steps_with_w:
+            if w is not None:
+                print(f"    - {nm}: weight={w}")
+    print()
 
-    # 使用独立参数集（和真实运行一致）
-    params = scenario.parameters.clone()
+    # 记录 CSV 行使用和计数器进度
+    csv_line_usage: Dict[str, set] = {}  # param_name -> set of row indices
+    csv_rows_start: Dict[str, dict] = {}  # worker_id, param_name -> start_row
+    csv_rows_end: Dict[str, dict] = {}
+    counter_start: Dict[str, dict] = {}
+    counter_end: Dict[str, dict] = {}
 
-    for i in range(1, iterations + 1):
-        # 生成这轮的参数
-        vars_dict = params.generate()
-        context = scenario.create_context(user_id=f"preview-user-{i}")
-        context.update(vars_dict)
+    for wid in range(num_workers):
+        wid_str = f"worker-{wid}"
+        # 每个 worker 独立参数集（和真实运行一致）
+        params = scenario.parameters.clone()
+        if hasattr(params, 'set_worker_context'):
+            params.set_worker_context(wid_str, num_workers)
 
-        print(f"{'='*70}")
-        print(f"  第 {i} 轮迭代 (Iteration {i})")
-        print(f"{'='*70}")
+        # 记录起始状态
+        csv_rows_start[wid_str] = {}
+        counter_start[wid_str] = {}
+        for pstat in params.get_stats():
+            nm = pstat.get('name')
+            if pstat.get('type') == 'csv':
+                csv_rows_start[wid_str][nm] = pstat.get('current_index', 0)
+                if nm not in csv_line_usage:
+                    csv_line_usage[nm] = set()
+            elif pstat.get('type') == 'counter' or pstat.get('type') == 'CounterParameter':
+                counter_start[wid_str][nm] = pstat.get('current_value') or pstat.get('start', 0)
 
-        for j, step in enumerate(scenario.steps, 1):
-            if not step.enabled:
-                print(f"\n  ▶ Step {j}: {step.name}  [跳过]")
-                continue
+        worker_header_shown = False
 
-            # 调用 request.execute 获得展开后的请求
-            request_result = step.request.execute(context.variables, scenario.default_headers)
+        for i in range(1, iterations + 1):
+            # 生成这轮的参数
+            vars_dict = params.generate()
+            context = scenario.create_context(user_id=f"preview-u-{wid}-{i}")
+            context.update(vars_dict)
 
-            print(f"\n  ▶ Step {j}: {step.name}")
-            print(f"    请求名: {request_result.request_name}")
-            print(f"    方法:   {request_result.method}")
-            print(f"    URL:    {request_result.url}")
+            # 记录 CSV 使用的行
+            for pstat in params.get_stats():
+                nm = pstat.get('name')
+                if pstat.get('type') == 'csv':
+                    idx = pstat.get('current_index', 0)
+                    total = pstat.get('total_rows_total', 0)
+                    # 当前正在使用的索引
+                    using_idx = (idx - 1) % max(1, total) if total else 0
+                    csv_line_usage.setdefault(nm, set()).add(using_idx)
 
-            if request_result.headers:
-                print(f"    Headers:")
-                for k, v in request_result.headers.items():
-                    print(f"      {k}: {v}")
-            else:
-                print(f"    Headers: (无)")
+            if not worker_header_shown:
+                print(f"  {'#' * sep_w}")
+                print(f"  # Worker: {wid_str}")
+                if num_workers > 1:
+                    # 显示这个 worker 分到的 CSV 分片
+                    for pstat in params.get_stats():
+                        if pstat.get('type') == 'csv':
+                            avail = pstat.get('total_rows_available', 0)
+                            mode = pstat.get('mode') or pstat.get('read_mode')
+                            total = pstat.get('total_rows_total', 0)
+                            shard_start = pstat.get('_shard_start')
+                            shard_end = pstat.get('_shard_end')
+                            if avail and mode and mode not in ('SEQUENTIAL', 'RANDOM'):
+                                if shard_start is not None and shard_end is not None:
+                                    print(f"  #   CSV [{pstat.get('name')}] 分片: 行 {shard_start}-{shard_end} (共{avail}/{total}行)")
+                                else:
+                                    print(f"  #   CSV [{pstat.get('name')}] 分片: 共{avail}/{total}行可用 (模式: {mode})")
+                            else:
+                                print(f"  #   CSV [{pstat.get('name')}] 模式: {mode} ({total}行)")
+                    for nm, v in counter_start[wid_str].items():
+                        print(f"  #   计数器 [{nm}] 起始: {v}")
+                worker_header_shown = True
 
-            if request_result.body is not None:
-                body_str = str(request_result.body)
-                if len(body_str) > 500:
-                    body_str = body_str[:500] + "..."
-                print(f"    Body:   {body_str}")
-            else:
-                print(f"    Body:   (无)")
+            print(f"  {'=' * (sep_w - 2)}")
+            print(f"    第 {i} 轮迭代 (Iteration {i})")
+            # 显示这轮参数值（可选）
+            if show_params and vars_dict:
+                preview_vals = []
+                for pk, pv in vars_dict.items():
+                    if isinstance(pv, dict):
+                        # 只显示前几列
+                        items = list(pv.items())
+                        short = ", ".join(f"{k}={v}" for k, v in items[:4])
+                        if len(items) > 4:
+                            short += "..."
+                        preview_vals.append(f"{pk}={{{short}}}")
+                    else:
+                        preview_vals.append(f"{pk}={pv}")
+                joined = ", ".join(preview_vals)
+                if len(joined) > 150:
+                    joined = joined[:147] + "..."
+                print(f"    参数: {joined}")
+            print(f"  {'=' * (sep_w - 2)}")
 
-            if step.think_time:
-                print(f"    Think:  {step.think_time}s")
+            for j, step in enumerate(scenario.steps, 1):
+                if not step.enabled:
+                    print(f"\n    > Step {j}: {step.name}  [跳过]")
+                    continue
 
-        print()
+                # 调用 request.execute 获得展开后的请求
+                request_result = step.request.execute(context.variables, scenario.default_headers)
 
-    print(f"\n✅ 预览完成，共 {iterations} 轮，每轮 {len([s for s in scenario.steps if s.enabled])} 个请求\n")
+                print(f"\n    > Step {j}: {step.name}")
+                print(f"      请求名: {request_result.request_name}")
+                print(f"      方法:   {request_result.method}")
+                print(f"      URL:    {request_result.url}")
+
+                if request_result.headers:
+                    print(f"      Headers:")
+                    for k, v in request_result.headers.items():
+                        print(f"        {k}: {v}")
+                else:
+                    print(f"      Headers: (无)")
+
+                if request_result.body is not None:
+                    body_str = str(request_result.body)
+                    if len(body_str) > 500:
+                        body_str = body_str[:500] + "..."
+                    print(f"      Body:   {body_str}")
+                else:
+                    print(f"      Body:   (无)")
+
+                if step.think_time:
+                    print(f"      Think:  {step.think_time}s")
+
+            print()
+
+        # 记录结束状态
+        csv_rows_end[wid_str] = {}
+        counter_end[wid_str] = {}
+        for pstat in params.get_stats():
+            nm = pstat.get('name')
+            if pstat.get('type') == 'csv':
+                csv_rows_end[wid_str][nm] = pstat.get('current_index', 0)
+            elif pstat.get('type') == 'counter' or pstat.get('type') == 'CounterParameter':
+                counter_end[wid_str][nm] = pstat.get('current_value') or pstat.get('start', 0)
+
+    # ====== 数据推进汇总 ======
+    print(f"\n  {'#' * sep_w}")
+    print(f"  # 数据推进汇总 (Data Progression Summary)")
+    print(f"  {'#' * sep_w}")
+
+    # CSV 汇总
+    if csv_line_usage:
+        print(f"\n    CSV 数据池使用情况:")
+        all_csv_stats = None
+        # 拿第一份参数集的 meta 信息
+        params0 = scenario.parameters.clone()
+        for pstat in params0.get_stats():
+            if pstat.get('type') == 'csv':
+                nm = pstat.get('name')
+                if nm in csv_line_usage:
+                    total_rows = pstat.get('total_rows_total', 0)
+                    used_rows = len(csv_line_usage.get(nm, set()))
+                    looped = used_rows > total_rows if total_rows else False
+                    pct = (used_rows / max(1, total_rows)) * 100 if total_rows else 0
+                    pct_str = f"{pct:.1f}%" if total_rows else "N/A"
+                    tag = " [循环复用!]" if looped else ""
+                    print(f"      [{nm}] 使用 {used_rows}/{total_rows} 行 ({pct_str}){tag}")
+                    # 显示各 worker 消耗行数
+                    for wid_str in sorted(csv_rows_start.keys()):
+                        s = csv_rows_start[wid_str].get(nm, 0)
+                        e = csv_rows_end[wid_str].get(nm, 0)
+                        consumed = e - s
+                        print(f"        - {wid_str}: 消耗 {consumed} 行 (idx {s} -> {e})")
+
+    # 计数器汇总
+    has_counter = False
+    for wid_str, cs in counter_end.items():
+        if cs:
+            has_counter = True
+            break
+    if has_counter:
+        print(f"\n    计数器进度:")
+        all_counter_names = set()
+        for wid_str in counter_end:
+            all_counter_names.update(counter_end[wid_str].keys())
+        for nm in sorted(all_counter_names):
+            print(f"      [{nm}]")
+            for wid_str in sorted(counter_end.keys()):
+                s = counter_start.get(wid_str, {}).get(nm)
+                e = counter_end.get(wid_str, {}).get(nm)
+                if s is not None and e is not None:
+                    print(f"        - {wid_str}: {s} -> {e} (增量 {e - s})")
+
+    total_enabled_steps = len([s for s in scenario.steps if s.enabled])
+    total_req = num_workers * iterations * total_enabled_steps
+    print(f"\n    总计预览请求数: {total_req} (Workers={num_workers} * 迭代={iterations} * 步骤={total_enabled_steps})")
+    print(f"  预览完成\n")
     return 0
 
 
@@ -371,6 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_arguments(preview_parser)
     preview_parser.add_argument("-n", "--iterations", type=int, default=3,
                                 help="预览迭代轮数 (默认: 3)")
+    preview_parser.add_argument("-w", "--workers", type=int, default=1,
+                                help="模拟的 Worker 数量 (默认: 1)")
+    preview_parser.add_argument("--hide-params", dest="show_params", action="store_false", default=True,
+                                help="不显示每轮参数值摘要")
 
     return parser
 

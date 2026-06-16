@@ -436,6 +436,8 @@ class CsvParameter(Parameter):
 
     def _init_sharding(self) -> None:
         """根据worker分片初始化数据"""
+        self._shard_start_idx = None
+        self._shard_end_idx = None
         if self.mode == CsvReadMode.WORKER_SHARDED and self._rows:
             total = len(self._rows)
             per_worker = max(1, total // self._total_workers)
@@ -453,9 +455,13 @@ class CsvParameter(Parameter):
             start = worker_idx * per_worker
             # 最后一个worker取剩下的所有行
             if worker_idx == self._total_workers - 1:
+                end = total
                 self._sharded_rows = self._rows[start:]
             else:
+                end = start + per_worker
                 self._sharded_rows = self._rows[start:start + per_worker]
+            self._shard_start_idx = start  # inclusive (0-based global row idx)
+            self._shard_end_idx = end - 1  # inclusive
         else:
             self._sharded_rows = self._rows
 
@@ -504,12 +510,19 @@ class CsvParameter(Parameter):
             "total_rows_total": len(self._rows),
             "total_rows_available": total_rows,
             "mode": self.mode.value,
+            "read_mode": self.mode.value,
             "loop": self.loop,
             "current_index": self._index,
             "loop_count": self._loop_count,
             "looped": self._loop_count > 0,
             "rows_used": min(self._call_count, total_rows) if self.mode != CsvReadMode.RANDOM else self._call_count,
             "recycled": self._loop_count > 0 or (self.mode == CsvReadMode.RANDOM and self._call_count > total_rows),
+            "_shard_start": self._shard_start_idx,
+            "_shard_end": self._shard_end_idx,
+            "shard_start": self._shard_start_idx,
+            "shard_end": self._shard_end_idx,
+            "worker_id": self._worker_id,
+            "total_workers": self._total_workers,
         })
         return stats
 

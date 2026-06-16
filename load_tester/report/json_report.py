@@ -197,6 +197,10 @@ class JsonReporter:
             "by_step": by_step,
             "by_status": by_status,
         }
+        if hasattr(m, 'parameter_stats') and m.parameter_stats:
+            report["parameter_stats"] = m.parameter_stats
+        if hasattr(m, 'csv_stats') and m.csv_stats:
+            report["csv_stats"] = m.csv_stats
         if scenario:
             report["scenario"] = scenario
         if histogram:

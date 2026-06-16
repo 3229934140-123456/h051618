@@ -1,0 +1,13 @@
+[PASS] Counter continuous increment
+[PASS] CSV sequential + loop + stats
+[PASS] CSV worker sharded
+[FAIL] Dot path access (user.product_id etc) - URL dot path: http://api.com/p/1001?cat=electronics
+[PASS] Step-level metrics (3 steps)
+[PASS] Step-level rate limiting (qps_limit=5)
+[PASS] CSV stats in result report
+[PASS] HTML report includes steps + params
+
+============================================================
+Results: 7 PASSED, 1 FAILED
+============================================================
+('[FAIL]', 'Dot path access (user.product_id etc)', 'URL dot path: http://api.com/p/1001?cat=electronics')

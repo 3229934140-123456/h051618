@@ -330,6 +330,7 @@ class WorkerPool:
         result_callback: Optional[Callable[[WorkerResult], None]] = None,
         rate_limiter=None,
         auto_restart: bool = True,
+        global_qps: Optional[float] = None,
     ):
         self.scenario = scenario
         self._initial_workers = num_workers
@@ -338,6 +339,7 @@ class WorkerPool:
         self._rate_limiter = rate_limiter
         self._auto_restart = auto_restart
         self._target_total_workers = num_workers  # 目标总worker数（用于CSV分片）
+        self._global_qps = global_qps  # 全局目标QPS（用于权重分摊）
 
         # 步骤级rate limiter（按步骤名 -> RateLimiter，所有Worker共享）
         self._step_rate_limiters: Dict[str, Any] = {}
@@ -350,15 +352,65 @@ class WorkerPool:
         self._is_running = False
 
     def _init_step_rate_limiters(self) -> None:
-        """为每个配置了qps_limit的步骤创建独立的令牌桶限速器"""
+        """为每个配置了qps_limit的步骤创建独立的令牌桶限速器
+
+        限速优先级（从高到低）：
+        1. 步骤本身配置了 qps_limit（硬限制）
+        2. 未配置 qps_limit 但配置了 weight 且有 global_qps 时：按权重分摊全局QPS
+
+        注意：全局 QPS 口径是所有 HTTP 请求总和（即真实发出的请求数），
+        所以每轮 N 步的场景会贡献 N 个请求，权重模式下服务端看到的总速率 = sum(step_qps) ≈ 配置值
+        """
         from .rate_limiter import TokenBucketRateLimiter
-        for step in self.scenario.steps:
-            if not step.enabled:
-                continue
+
+        enabled_steps = [s for s in self.scenario.steps if s.enabled]
+        if not enabled_steps:
+            return
+
+        # 阶段1: 应用步骤自身 qps_limit 的硬限制
+        for step in enabled_steps:
             if step.qps_limit is not None and step.qps_limit > 0:
                 self._step_rate_limiters[step.name] = TokenBucketRateLimiter(
                     rate_per_second=step.qps_limit,
                 )
+
+        # 阶段2: 权重分摊全局QPS（仅对未设置硬限制的步骤生效）
+        if self._global_qps and self._global_qps > 0:
+            # 计算硬限制已占用的 QPS
+            hard_limited_qps = 0.0
+            weight_sum = 0
+            weighted_steps = []
+            for step in enabled_steps:
+                if step.name in self._step_rate_limiters:
+                    hard_limited_qps += self._step_rate_limiters[step.name].rate_per_second
+                else:
+                    sw = getattr(step, 'weight', 1) or 1
+                    weight_sum += max(0.01, sw)
+                    weighted_steps.append(step)
+
+            remaining_qps = max(0.0, self._global_qps - hard_limited_qps)
+
+            # 若还有QPS余量，按权重分摊
+            if remaining_qps > 0 and weighted_steps:
+                for step in weighted_steps:
+                    sw = getattr(step, 'weight', 1) or 1
+                    w = max(0.01, sw)
+                    step_share = remaining_qps * (w / weight_sum)
+                    # 给未设置 qps_limit 的步骤创建权重式限速器
+
+                    existing = self._step_rate_limiters.get(step.name)
+                    if existing is None:
+                        self._step_rate_limiters[step.name] = TokenBucketRateLimiter(
+                            rate_per_second=step_share,
+                        )
+                    else:
+                        pass  # 已存在硬限制，保持不变
+
+        # 保存配置摘要
+        self._step_rate_summary = {
+            name: r.rate_per_second
+            for name, r in self._step_rate_limiters.items()
+        }
 
     @property
     def active_workers(self) -> int:
@@ -426,22 +478,58 @@ class WorkerPool:
                 if hasattr(worker, '_parameters') and worker._parameters is not None:
                     for csv_stat in worker._parameters.get_csv_stats():
                         name = csv_stat.get('name', 'unknown')
+                        call_count = csv_stat.get('call_count', 0)
+                        loop_count = csv_stat.get('loop_count', 0)
+                        looped = csv_stat.get('looped', False)
+                        rows_used = csv_stat.get('rows_used', 0)
+                        rows_available = csv_stat.get('total_rows_available', csv_stat.get('total_rows_total', 0))
+                        recycled = csv_stat.get('recycled', False)
+                        rows_total = csv_stat.get('total_rows_total', 0)
+
                         if name not in csv_by_name:
                             csv_by_name[name] = {
                                 'name': name,
+                                'type': 'csv',
                                 'csv_path': csv_stat.get('csv_path'),
+                                'read_mode': csv_stat.get('mode'),
                                 'mode': csv_stat.get('mode'),
-                                'total_rows': csv_stat.get('total_rows_total', 0),
+                                'total_rows': rows_total,
+                                'total_rows_available_sum': 0,
+                                'rows_used_max': 0,
+                                'rows_used_sum': 0,
                                 'total_call_count': 0,
                                 'workers_using': 0,
                                 'any_looped': False,
+                                'any_recycled': False,
                                 'loop_counts': [],
+                                'rows_used_per_worker': {},
+                                'call_count_per_worker': {},
+                                'loop_count_per_worker': {},
                             }
-                        csv_by_name[name]['total_call_count'] += csv_stat.get('call_count', 0)
-                        csv_by_name[name]['workers_using'] += 1
-                        if csv_stat.get('looped', False):
-                            csv_by_name[name]['any_looped'] = True
-                        csv_by_name[name]['loop_counts'].append(csv_stat.get('loop_count', 0))
+                        s = csv_by_name[name]
+                        s['total_call_count'] += call_count
+                        s['workers_using'] += 1
+                        s['total_rows_available_sum'] += rows_available
+                        s['rows_used_sum'] += rows_used
+                        if rows_used > s['rows_used_max']:
+                            s['rows_used_max'] = rows_used
+                        if looped:
+                            s['any_looped'] = True
+                        if recycled:
+                            s['any_recycled'] = True
+                        s['loop_counts'].append(loop_count)
+                        s['rows_used_per_worker'][wid] = rows_used
+                        s['call_count_per_worker'][wid] = call_count
+                        s['loop_count_per_worker'][wid] = loop_count
+                        # 冗余字段，便于报告直接用
+                        s['rows_used'] = s['rows_used_max']
+                        s['call_count'] = s['total_call_count']
+                        s['looped'] = s['any_looped']
+                        s['loop_count'] = max(s['loop_counts']) if s['loop_counts'] else 0
+                        s['recycled'] = s['any_recycled']
+                        s['coverage_pct'] = round(
+                            (s['rows_used_max'] / max(1, rows_total)) * 100, 2
+                        ) if rows_total else 0
         return list(csv_by_name.values())
 
     def start(self) -> None:

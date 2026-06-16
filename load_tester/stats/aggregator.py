@@ -142,8 +142,16 @@ class StepMetrics:
     overall_qps: float = 0.0
     peak_qps: float = 0.0
     latency: PercentileMetrics = field(default_factory=PercentileMetrics)
+    # 成功/失败请求独立的延迟分布（用于按类型切换分析）
+    success_latency: PercentileMetrics = field(default_factory=PercentileMetrics)
+    failure_latency: PercentileMetrics = field(default_factory=PercentileMetrics)
+    # 状态码分布（详情）
+    status_code_distribution: Dict[int, int] = field(default_factory=dict)
     errors: ErrorMetrics = field(default_factory=ErrorMetrics)
     qps_series: List[Tuple[float, float]] = field(default_factory=list)  # [(timestamp, qps), ...]
+    # QPS时序：成功/失败分开
+    success_qps_series: List[Tuple[float, float]] = field(default_factory=list)
+    failure_qps_series: List[Tuple[float, float]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -155,10 +163,23 @@ class StepMetrics:
             "overall_qps": round(self.overall_qps, 2),
             "peak_qps": round(self.peak_qps, 2),
             "latency": self.latency.to_dict(),
+            "success_latency": self.success_latency.to_dict(),
+            "failure_latency": self.failure_latency.to_dict(),
+            "status_code_distribution": {
+                str(k): v for k, v in sorted(self.status_code_distribution.items())
+            },
             "errors": self.errors.to_dict(),
             "qps_series": [
                 {"timestamp": ts, "qps": round(qps, 2)}
                 for ts, qps in self.qps_series
+            ],
+            "success_qps_series": [
+                {"timestamp": ts, "qps": round(qps, 2)}
+                for ts, qps in self.success_qps_series
+            ],
+            "failure_qps_series": [
+                {"timestamp": ts, "qps": round(qps, 2)}
+                for ts, qps in self.failure_qps_series
             ],
         }
 
@@ -279,6 +300,9 @@ class MetricsAggregator(MetricsSink):
         # ========== 按步骤/请求名的详细统计 ==========
         # 每个步骤独立的直方图
         self._step_histograms: Dict[str, HdrHistogram] = {}
+        # 成功/失败各自独立的直方图，用于按类型切换查看
+        self._step_success_histograms: Dict[str, HdrHistogram] = {}
+        self._step_failure_histograms: Dict[str, HdrHistogram] = {}
         # 每个步骤的计数
         self._step_total: Dict[str, int] = defaultdict(int)
         self._step_success: Dict[str, int] = defaultdict(int)
@@ -390,6 +414,24 @@ class MetricsAggregator(MetricsSink):
                     significant_digits=self._sig_digits,
                 )
             self._step_histograms[name].record_value(latency_ns)
+
+            # 成功/失败独立直方图
+            if sample.is_success:
+                if name not in self._step_success_histograms:
+                    self._step_success_histograms[name] = HdrHistogram(
+                        lowest_value_ns=self._hist_lo,
+                        highest_value_ns=self._hist_hi,
+                        significant_digits=self._sig_digits,
+                    )
+                self._step_success_histograms[name].record_value(latency_ns)
+            else:
+                if name not in self._step_failure_histograms:
+                    self._step_failure_histograms[name] = HdrHistogram(
+                        lowest_value_ns=self._hist_lo,
+                        highest_value_ns=self._hist_hi,
+                        significant_digits=self._sig_digits,
+                    )
+                self._step_failure_histograms[name].record_value(latency_ns)
 
             # 计数
             self._step_total[name] += 1
@@ -592,11 +634,26 @@ class MetricsAggregator(MetricsSink):
             sm.overall_qps = sm.total_requests / duration if duration > 0 else 0.0
             sm.latency = self._histogram_to_percentile_metrics(hist)
 
+            # 成功/失败独立延迟分布
+            if name in self._step_success_histograms:
+                sm.success_latency = self._histogram_to_percentile_metrics(
+                    self._step_success_histograms[name]
+                )
+            if name in self._step_failure_histograms:
+                sm.failure_latency = self._histogram_to_percentile_metrics(
+                    self._step_failure_histograms[name]
+                )
+
+            # 状态码分布（详情）
+            sm.status_code_distribution = dict(
+                self._step_status_codes.get(name, {})
+            )
+
             # 错误统计
             err = ErrorMetrics()
             err.total_errors = sm.total_failures
             err.error_rate = 1.0 - sm.success_rate if sm.total_requests > 0 else 0.0
-            err.by_status_code = dict(self._step_status_codes.get(name, {}))
+            err.by_status_code = dict(sm.status_code_distribution)
             err_msgs = dict(self._step_error_msgs.get(name, {}))
             err.by_error_message = err_msgs
             if err_msgs:
@@ -611,27 +668,44 @@ class MetricsAggregator(MetricsSink):
                 ]
             sm.errors = err
 
-            # QPS 时间线（按秒去重）
+            # QPS 时间线（按秒去重），总/成功/失败分别统计
             qps_by_ts: Dict[float, float] = {}
+            success_qps_by_ts: Dict[float, float] = {}
+            failure_qps_by_ts: Dict[float, float] = {}
             peak = 0.0
-            for bucket_ts, total, _success in self._step_buckets.get(name, deque()):
+            for bucket_ts, total, success in self._step_buckets.get(name, deque()):
                 qps = total / self._bucket_size
+                sqps = success / self._bucket_size
+                fqps = (total - success) / self._bucket_size
                 if qps > peak:
                     peak = qps
                 qps_by_ts[bucket_ts] = qps
+                success_qps_by_ts[bucket_ts] = sqps
+                failure_qps_by_ts[bucket_ts] = fqps
 
             # 当前桶
             cur_ts = self._step_current_bucket_ts.get(name)
             cur_total = self._step_current_bucket_total.get(name, 0)
+            cur_success = self._step_current_bucket_success.get(name, 0)
             if cur_ts is not None and cur_total > 0:
                 qps = cur_total / self._bucket_size
+                sqps = cur_success / self._bucket_size
+                fqps = (cur_total - cur_success) / self._bucket_size
                 if qps > peak:
                     peak = qps
                 if cur_ts not in qps_by_ts or qps > qps_by_ts[cur_ts]:
                     qps_by_ts[cur_ts] = qps
+                    success_qps_by_ts[cur_ts] = sqps
+                    failure_qps_by_ts[cur_ts] = fqps
 
             sm.peak_qps = peak
             sm.qps_series = sorted(qps_by_ts.items(), key=lambda x: x[0])
+            sm.success_qps_series = sorted(
+                success_qps_by_ts.items(), key=lambda x: x[0]
+            )
+            sm.failure_qps_series = sorted(
+                failure_qps_by_ts.items(), key=lambda x: x[0]
+            )
 
             result[name] = sm
 

@@ -714,20 +714,60 @@ class HtmlReporter:
                     )
                 error_summary = f'<div class="step-errors"><h5>错误摘要 (Top)</h5><ul>{"".join(err_items)}</ul></div>'
 
-            # 状态码分布
+            # 状态码分布（详细比例条）
             status_code_html = ""
-            if step.errors and step.errors.by_status_code:
-                items = []
-                for code, cnt in sorted(step.errors.by_status_code.items()):
-                    pct = cnt / step.total_requests * 100 if step.total_requests else 0
-                    items.append(f'<span class="status-badge code-{code}">{code}: {cnt} ({pct:.1f}%)</span>')
-                status_code_html = f'<div class="step-status-codes"><h5>状态码分布</h5>{" ".join(items)}</div>'
+            scd = getattr(step, "status_code_distribution", None) or (step.errors.by_status_code if step.errors else {})
+            if scd:
+                sc_rows = []
+                for code, cnt in sorted(scd.items()):
+                    share = cnt / step.total_requests * 100 if step.total_requests else 0
+                    if str(code).startswith("2"):
+                        sc_color = "#10b981"
+                    elif str(code).startswith("3"):
+                        sc_color = "#3b82f6"
+                    elif str(code).startswith("4"):
+                        sc_color = "#f59e0b"
+                    elif str(code).startswith("5"):
+                        sc_color = "#ef4444"
+                    else:
+                        sc_color = "#64748b"
+                    sc_rows.append(
+                        f'<div style="margin:4px 0;">'
+                        f'<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px;">'
+                        f'<span><span style="display:inline-block;width:10px;height:10px;background:{sc_color};'
+                        f'border-radius:2px;margin-right:6px;vertical-align:middle;"></span>'
+                        f'<strong>HTTP {code}</strong></span>'
+                        f'<span>{cnt:,} ({share:.1f}%)</span>'
+                        f'</div>'
+                        f'<div style="background:#f1f5f9;border-radius:3px;height:6px;overflow:hidden;">'
+                        f'<div style="background:{sc_color};height:100%;width:{min(share,100):.1f}%;"></div>'
+                        f'</div>'
+                        f'</div>'
+                    )
+                status_code_html = f'<div class="step-status-codes"><h5>状态码分布</h5>{"".join(sc_rows)}</div>'
 
-            # QPS 时间线（简化版：迷你 sparkline）
-            qps_sparkline = ""
-            if step.qps_series:
-                qps_sparkline = self._build_step_qps_sparkline(step.qps_series)
+            def _pct_row(pm):
+                if not pm or pm.count == 0:
+                    return '<tr><td colspan="9" style="color:#94a3b8;text-align:center;">暂无数据</td></tr>'
+                return (
+                    f"<tr>"
+                    f"<td>{pm.min_ms:.1f}</td>"
+                    f"<td>{pm.p50_ms:.1f}</td>"
+                    f"<td>{pm.p75_ms:.1f}</td>"
+                    f"<td>{pm.p90_ms:.1f}</td>"
+                    f"<td>{pm.p95_ms:.1f}</td>"
+                    f"<td>{pm.p99_ms:.1f}</td>"
+                    f"<td>{pm.p999_ms:.1f}</td>"
+                    f"<td>{pm.max_ms:.1f}</td>"
+                    f"<td>{pm.mean_ms:.1f}</td>"
+                    f"</tr>"
+                )
 
+            lat_all = _pct_row(step.latency)
+            lat_ok = _pct_row(getattr(step, "success_latency", None))
+            lat_err = _pct_row(getattr(step, "failure_latency", None))
+
+            tid = abs(hash(name)) % 10000000
             steps_html.append(f"""
 <details class="step-card">
   <summary>
@@ -740,89 +780,160 @@ class HtmlReporter:
         <span class="metric"><strong>{step.latency.p50_ms:.1f}ms</strong><small>P50</small></span>
         <span class="metric"><strong>{step.latency.p95_ms:.1f}ms</strong><small>P95</small></span>
         <span class="metric"><strong>{step.latency.p99_ms:.1f}ms</strong><small>P99</small></span>
-        <span class="metric status {status_cls}">{"✓" if step.success_rate >= 0.95 else "⚠"}</span>
+        <span class="metric status {status_cls}">{"OK" if step.success_rate >= 0.95 else "WARN"}</span>
       </div>
     </div>
   </summary>
   <div class="step-body">
+
     <div class="step-latency">
-      <h5>延迟分布 (ms)</h5>
-      <table class="mini-table">
+      <h5>延迟分布 (ms)
+        <span style="display:inline-flex;margin-left:12px;gap:4px;font-weight:normal;">
+          <label style="cursor:pointer;font-size:12px;padding:2px 8px;border:1px solid #cbd5e1;border-radius:4px;background:#f8fafc;">
+            <input type="radio" name="latTab{tid}" class="lat-tab-radio" value="all" checked style="display:none;">
+            <span class="lat-tab-label" data-tab="all" data-tid="{tid}">全部 ({step.total_requests:,})</span>
+          </label>
+          <label style="cursor:pointer;font-size:12px;padding:2px 8px;border:1px solid #cbd5e1;border-radius:4px;">
+            <input type="radio" name="latTab{tid}" class="lat-tab-radio" value="success" style="display:none;">
+            <span class="lat-tab-label success-label" data-tab="success" data-tid="{tid}">成功 ({step.total_success:,})</span>
+          </label>
+          <label style="cursor:pointer;font-size:12px;padding:2px 8px;border:1px solid #cbd5e1;border-radius:4px;">
+            <input type="radio" name="latTab{tid}" class="lat-tab-radio" value="failure" style="display:none;">
+            <span class="lat-tab-label failure-label" data-tab="failure" data-tid="{tid}">失败 ({step.total_failures:,})</span>
+          </label>
+        </span>
+      </h5>
+      <table class="mini-table lat-tab-content" data-tab="all" data-tid="{tid}">
         <tr><th>Min</th><th>P50</th><th>P75</th><th>P90</th><th>P95</th><th>P99</th><th>P99.9</th><th>Max</th><th>Mean</th></tr>
-        <tr>
-          <td>{step.latency.min_ms:.1f}</td>
-          <td>{step.latency.p50_ms:.1f}</td>
-          <td>{step.latency.p75_ms:.1f}</td>
-          <td>{step.latency.p90_ms:.1f}</td>
-          <td>{step.latency.p95_ms:.1f}</td>
-          <td>{step.latency.p99_ms:.1f}</td>
-          <td>{step.latency.p999_ms:.1f}</td>
-          <td>{step.latency.max_ms:.1f}</td>
-          <td>{step.latency.mean_ms:.1f}</td>
-        </tr>
+        {lat_all}
+      </table>
+      <table class="mini-table lat-tab-content" data-tab="success" data-tid="{tid}" style="display:none;">
+        <tr><th>Min</th><th>P50</th><th>P75</th><th>P90</th><th>P95</th><th>P99</th><th>P99.9</th><th>Max</th><th>Mean</th></tr>
+        {lat_ok}
+      </table>
+      <table class="mini-table lat-tab-content" data-tab="failure" data-tid="{tid}" style="display:none;">
+        <tr><th>Min</th><th>P50</th><th>P75</th><th>P90</th><th>P95</th><th>P99</th><th>P99.9</th><th>Max</th><th>Mean</th></tr>
+        {lat_err}
       </table>
     </div>
+
     <div class="step-qps-section">
-      <h5>QPS 时间线</h5>
+      <h5>QPS 时间线
+        <span style="display:inline-flex;margin-left:12px;gap:4px;font-weight:normal;">
+          <label style="cursor:pointer;font-size:12px;padding:2px 8px;border:1px solid #cbd5e1;border-radius:4px;background:#f8fafc;">
+            <input type="radio" name="qpsTab{tid}" class="qps-tab-radio" value="all" checked style="display:none;">
+            <span class="qps-tab-label" data-tab="all" data-tid="{tid}">全部</span>
+          </label>
+          <label style="cursor:pointer;font-size:12px;padding:2px 8px;border:1px solid #cbd5e1;border-radius:4px;">
+            <input type="radio" name="qpsTab{tid}" class="qps-tab-radio" value="success" style="display:none;">
+            <span class="qps-tab-label success-label" data-tab="success" data-tid="{tid}">成功</span>
+          </label>
+          <label style="cursor:pointer;font-size:12px;padding:2px 8px;border:1px solid #cbd5e1;border-radius:4px;">
+            <input type="radio" name="qpsTab{tid}" class="qps-tab-radio" value="failure" style="display:none;">
+            <span class="qps-tab-label failure-label" data-tab="failure" data-tid="{tid}">失败</span>
+          </label>
+        </span>
+      </h5>
       <div class="step-qps-info">
         <span>平均: <strong>{step.overall_qps:.2f}/s</strong></span>
         <span>峰值: <strong>{step.peak_qps:.2f}/s</strong></span>
+        <span>成功: <strong>{step.total_success:,}</strong></span>
+        <span>失败: <strong style="color:{("#ef4444" if step.total_failures else "#94a3b8")};">{step.total_failures:,}</strong></span>
       </div>
-      {qps_sparkline}
+      <div class="qps-tab-content" data-tab="all" data-tid="{tid}">{self._build_step_qps_sparkline_with_color(step.qps_series, "#667eea", f"a{tid}")}</div>
+      <div class="qps-tab-content" data-tab="success" data-tid="{tid}" style="display:none;">{self._build_step_qps_sparkline_with_color(step.success_qps_series, "#10b981", f"o{tid}")}</div>
+      <div class="qps-tab-content" data-tab="failure" data-tid="{tid}" style="display:none;">{self._build_step_qps_sparkline_with_color(step.failure_qps_series, "#ef4444", f"e{tid}")}</div>
     </div>
+
     {status_code_html}
     {error_summary}
   </div>
 </details>
 """)
 
-        return "".join(steps_html)
+        tab_js = """
+<script>
+(function(){
+  function bindTab(radioSel, contentSel, labelClass){
+    document.querySelectorAll(radioSel).forEach(function(r){
+      r.addEventListener('change', function(){
+        var tab = this.value;
+        var m = this.name.match(/(\\d+)/);
+        var tid = m ? m[1] : '';
+        document.querySelectorAll(contentSel + '[data-tid=\"' + tid + '\"]').forEach(function(el){
+          el.style.display = (el.dataset.tab === tab) ? '' : 'none';
+        });
+        document.querySelectorAll(labelClass + '[data-tid=\"' + tid + '\"]').forEach(function(lbl){
+          if (lbl.dataset.tab === tab) {
+            lbl.parentElement.style.background = '#f8fafc';
+            lbl.parentElement.style.border = '1px solid #94a3b8';
+            lbl.parentElement.style.fontWeight = '600';
+          } else {
+            lbl.parentElement.style.background = '';
+            lbl.parentElement.style.border = '1px solid #cbd5e1';
+            lbl.parentElement.style.fontWeight = '';
+          }
+        });
+      });
+    });
+    document.querySelectorAll(radioSel + ':checked').forEach(function(r){
+      r.dispatchEvent(new Event('change'));
+    });
+  }
+  function init(){
+    bindTab('.lat-tab-radio', '.lat-tab-content', '.lat-tab-label');
+    bindTab('.qps-tab-radio', '.qps-tab-content', '.qps-tab-label');
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+<style>
+.success-label{color:#10b981;}
+.failure-label{color:#ef4444;}
+</style>
+"""
+        return "".join(steps_html) + tab_js
 
-    def _build_step_qps_sparkline(self, qps_series: List[Tuple[float, float]]) -> str:
-        """生成步骤QPS的迷你折线图（sparkline）"""
+    def _build_step_qps_sparkline_with_color(
+        self, qps_series, color, grad_id
+    ):
         if not qps_series:
-            return ""
-
+            return '<div style="color:#94a3b8;padding:20px;text-align:center;font-size:12px;">暂无数据</div>'
         width = 600
         height = 80
         padding = 10
-
         values = [q for _, q in qps_series]
-        if not values:
-            return ""
-
-        max_v = max(values) if values else 1
-        if max_v == 0:
-            max_v = 1
-
+        max_v = max(values) or 1
         n = len(values)
         if n <= 1:
-            return '<div class="sparkline-placeholder">数据点不足</div>'
-
-        # 生成 SVG path
+            return '<div style="color:#94a3b8;padding:12px;text-align:center;font-size:12px;">数据点不足</div>'
         points = []
         for i, v in enumerate(values):
             x = padding + (width - 2 * padding) * i / (n - 1)
             y = height - padding - (height - 2 * padding) * v / max_v
             points.append(f"{x:.1f},{y:.1f}")
-
         path_d = "M " + " L ".join(points)
-
-        # 填充区域
         area_d = path_d + f" L {width-padding:.1f},{height-padding:.1f} L {padding:.1f},{height-padding:.1f} Z"
-
         return f"""
 <svg class="sparkline" viewBox="0 0 {width} {height}" preserveAspectRatio="none">
   <defs>
-    <linearGradient id="stepQpsGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#667eea" stop-opacity="0.3"/>
-      <stop offset="100%" stop-color="#667eea" stop-opacity="0.05"/>
+    <linearGradient id="{grad_id}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="{color}" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="{color}" stop-opacity="0.05"/>
     </linearGradient>
   </defs>
-  <path d="{area_d}" fill="url(#stepQpsGrad)"/>
-  <path d="{path_d}" fill="none" stroke="#667eea" stroke-width="1.5"/>
+  <path d="{area_d}" fill="url(#{grad_id})"/>
+  <path d="{path_d}" fill="none" stroke="{color}" stroke-width="1.5"/>
 </svg>
 """
+
+    def _build_step_qps_sparkline(self, qps_series):
+        """生成步骤QPS的迷你折线图（sparkline）- 兼容老接口"""
+        return self._build_step_qps_sparkline_with_color(qps_series, "#667eea", "compatGrad")
 
     def _status_section(self, m: AggregatedMetrics) -> str:
         if not m.by_status:
@@ -908,62 +1019,114 @@ class HtmlReporter:
         if m.csv_stats:
             html.append('<h3 style="margin-top:16px;">CSV 数据池</h3>')
             html.append('<div class="table-wrap"><table><thead><tr>')
-            html.append("<th>参数名</th><th>读取模式</th><th>总行数</th><th>实际使用行数</th>")
-            html.append("<th>循环次数</th><th>是否循环复用</th><th>调用总次数</th>")
+            html.append("<th>参数名</th><th>读取模式</th><th>总行数</th><th>覆盖率 (max)</th>")
+            html.append("<th>循环次数</th><th>循环复用</th><th>调用总次数</th><th>Worker数</th>")
             html.append("</tr></thead><tbody>")
 
             for s in m.csv_stats:
                 name = s.get("name", "?")
-                mode = s.get("read_mode", "?")
+                mode = s.get("read_mode") or s.get("mode", "?")
                 total_rows = s.get("total_rows", 0)
-                rows_used = s.get("rows_used", 0)
+                rows_used = s.get("rows_used", 0) or s.get("rows_used_max", 0)
                 loop_count = s.get("loop_count", 0)
-                recycled = s.get("recycled", False)
-                call_count = s.get("call_count", 0)
+                recycled = s.get("recycled", False) or s.get("any_recycled", False)
+                call_count = s.get("call_count", 0) or s.get("total_call_count", 0)
+                workers_using = s.get("workers_using", 0)
+                coverage_pct = s.get("coverage_pct")
+                if coverage_pct is None:
+                    coverage_pct = round((rows_used / max(1, total_rows)) * 100, 2) if total_rows else 0
                 recycled_tag = '<span class="badge warn">是</span>' if recycled else '<span class="badge good">否</span>'
+                coverage_color = "#10b981" if coverage_pct >= 80 else ("#f59e0b" if coverage_pct >= 50 else "#ef4444")
+                if recycled:
+                    coverage_color = "#f59e0b"
 
                 # 使用比例条
-                pct = (rows_used / max(1, total_rows)) * 100 if total_rows else 0
                 usage_bar = (
-                    f'<div style="width:120px;height:8px;background:#eee;border-radius:4px;overflow:hidden;">'
-                    f'<div style="width:{min(pct, 100):.1f}%;height:100%;'
-                    f'background:{"#f59e0b" if recycled else "#10b981"};"></div></div>'
-                    f'<div style="font-size:12px;color:#666;">{rows_used}/{total_rows} ({pct:.1f}%)</div>'
+                    f'<div style="width:150px;height:10px;background:#eee;border-radius:4px;overflow:hidden;">'
+                    f'<div style="width:{min(coverage_pct, 100):.1f}%;height:100%;'
+                    f'background:{coverage_color};"></div></div>'
+                    f'<div style="font-size:12px;color:#666;">{rows_used}/{total_rows} ({coverage_pct:.1f}%)</div>'
                 )
 
                 html.append(
                     f"<tr>"
-                    f"<td style='text-align:left;'>{name}</td>"
+                    f"<td style='text-align:left;font-weight:600;'>{name}</td>"
                     f"<td>{mode}</td>"
                     f"<td>{total_rows:,}</td>"
                     f"<td>{usage_bar}</td>"
                     f"<td>{loop_count}</td>"
                     f"<td>{recycled_tag}</td>"
                     f"<td>{call_count:,}</td>"
+                    f"<td>{workers_using}</td>"
                     f"</tr>"
                 )
 
             html.append("</tbody></table></div>")
 
-        # 其他参数统计（计数器、序列等）
-        if m.parameter_stats:
-            other_params = [p for p in m.parameter_stats if p.get("type") != "csv"]
-            if other_params:
-                html.append('<h3 style="margin-top:16px;">其他参数</h3>')
-                html.append('<div class="table-wrap"><table><thead><tr>')
-                html.append("<th>参数名</th><th>类型</th><th>调用次数</th><th>当前值/说明</th>")
-                html.append("</tr></thead><tbody>")
-
-                for p in other_params:
-                    name = p.get("name", "?")
-                    ptype = p.get("type", "?")
-                    call_count = p.get("call_count", 0)
-                    current = p.get("current_value", "") or p.get("description", "")
+            # Worker 使用量详情（每个 CSV 展开显示）
+            for s in m.csv_stats:
+                name = s.get("name", "?")
+                call_per_w = s.get("call_count_per_worker", {})
+                rows_per_w = s.get("rows_used_per_worker", {})
+                loop_per_w = s.get("loop_count_per_worker", {})
+                if not call_per_w:
+                    continue
+                html.append(
+                    f'<details class="worker-details" style="margin-top:8px;">'
+                    f'<summary style="cursor:pointer;color:#475569;padding:4px 0;">'
+                    f'📋 {name} - 各 Worker 使用明细 (点击展开)</summary>'
+                )
+                html.append(
+                    '<div class="table-wrap" style="margin-top:8px;">'
+                    '<table style="font-size:13px;"><thead><tr>'
+                    '<th>Worker ID</th><th>调用次数</th><th>使用行数</th><th>循环次数</th>'
+                    '</tr></thead><tbody>'
+                )
+                for wid in sorted(call_per_w.keys()):
                     html.append(
                         f"<tr>"
-                        f"<td style='text-align:left;'>{name}</td>"
+                        f"<td style='text-align:left;'>{wid}</td>"
+                        f"<td>{call_per_w.get(wid, 0):,}</td>"
+                        f"<td>{rows_per_w.get(wid, 0):,}</td>"
+                        f"<td>{loop_per_w.get(wid, 0)}</td>"
+                        f"</tr>"
+                    )
+                html.append("</tbody></table></div></details>")
+
+        # 其他参数统计（计数器、序列等）
+        if m.parameter_stats:
+            # 按参数名聚合，显示每个 worker 的情况
+            param_by_name: Dict[str, list] = {}
+            for p in m.parameter_stats:
+                nm = p.get("name", "?")
+                if p.get("type") == "csv":
+                    continue
+                if nm not in param_by_name:
+                    param_by_name[nm] = []
+                param_by_name[nm].append(p)
+
+            if param_by_name:
+                html.append('<h3 style="margin-top:24px;">其他参数</h3>')
+                html.append('<div class="table-wrap"><table><thead><tr>')
+                html.append("<th>参数名</th><th>类型</th><th>总调用次数</th><th>Worker分布</th><th>当前值/说明</th>")
+                html.append("</tr></thead><tbody>")
+
+                for nm, entries in param_by_name.items():
+                    ptype = entries[0].get("type", "?")
+                    total_calls = sum(e.get("call_count", 0) for e in entries)
+                    current = entries[0].get("current_value", "") or entries[0].get("description", "")
+                    worker_dist = ", ".join(
+                        f"{e.get('worker_id', '?')}:{e.get('call_count', 0)}"
+                        for e in sorted(entries, key=lambda x: x.get("worker_id", ""))
+                    )
+                    if len(worker_dist) > 80:
+                        worker_dist = worker_dist[:77] + "..."
+                    html.append(
+                        f"<tr>"
+                        f"<td style='text-align:left;font-weight:600;'>{nm}</td>"
                         f"<td>{ptype}</td>"
-                        f"<td>{call_count:,}</td>"
+                        f"<td>{total_calls:,}</td>"
+                        f"<td style='text-align:left;font-size:12px;color:#666;'>{worker_dist}</td>"
                         f"<td style='text-align:left;'>{current}</td>"
                         f"</tr>"
                     )

@@ -69,6 +69,8 @@ class HttpRequest(Request):
     def resolve_template(self, template: str, context: Dict[str, Any]) -> str:
         """解析模板中的变量占位符 ${variable}
 
+        支持点号路径访问，如 ${user.product_id} 将从 context['user']['product_id'] 取值。
+
         Args:
             template: 模板字符串，如 "https://api.example.com/users/${userId}"
             context: 变量上下文字典
@@ -79,9 +81,27 @@ class HttpRequest(Request):
         import re
         pattern = re.compile(r'\$\{([^}]+)\}')
 
+        def _resolve_path(path: str, ctx: Dict[str, Any]) -> Any:
+            """解析点号路径，如 'user.address.city'"""
+            parts = path.split('.')
+            current: Any = ctx
+            for part in parts:
+                if isinstance(current, dict):
+                    if part in current:
+                        current = current[part]
+                    else:
+                        return None
+                elif hasattr(current, part):
+                    current = getattr(current, part)
+                else:
+                    return None
+            return current
+
         def replacer(match):
-            var_name = match.group(1)
-            value = context.get(var_name, match.group(0))
+            var_path = match.group(1)
+            value = _resolve_path(var_path, context)
+            if value is None:
+                return match.group(0)
             return str(value)
 
         return pattern.sub(replacer, template)

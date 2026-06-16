@@ -278,6 +278,7 @@ class LoadTestEngine:
             result_callback=self._collector.record_from_worker_result
             if self._collector else None,
             rate_limiter=self._rate_limiter,
+            global_qps=self._get_initial_qps(config),
         )
 
     def _get_initial_qps(self, config: LoadTestConfig) -> Optional[float]:
