@@ -1,0 +1,322 @@
+"""命令行接口 (CLI)
+
+提供命令行入口，支持从Python脚本文件加载场景定义并执行压测。
+
+使用方式：
+  python -m load_tester.cli run scenario_script.py --duration 120 --concurrency 50
+  python -m load_tester.cli run scenario_script.py --mode step --steps "..."
+  python -m load_tester.cli list scenario_script.py
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from .engine import LoadTestConfig, LoadTestEngine, LoadTestResult
+
+
+def _parse_steps_arg(steps_str: str):
+    """解析步骤参数字符串
+
+    格式: "120,10,100;120,25,250;120,50,500"
+    表示3个阶梯：(时长秒, 并发数, QPS)
+    """
+    result = []
+    for step_str in steps_str.split(";"):
+        step_str = step_str.strip()
+        if not step_str:
+            continue
+        parts = step_str.split(",")
+        if len(parts) < 2:
+            raise ValueError(f"Invalid step format: {step_str}. Need duration,concurrency[,qps]")
+        duration = float(parts[0].strip())
+        concurrency = int(parts[1].strip())
+        qps = float(parts[2].strip()) if len(parts) >= 3 and parts[2].strip() else None
+        result.append((duration, concurrency, qps))
+    return result
+
+
+def _load_scenario_from_file(script_path: Path):
+    """从Python脚本文件中加载 Scenario 对象
+
+    脚本需要:
+    - 定义一个名为 'scenario' 的 Scenario 实例，或
+    - 定义 build_scenario() 函数返回 Scenario
+    """
+    if not script_path.exists():
+        raise FileNotFoundError(f"Scenario script not found: {script_path}")
+
+    spec = importlib.util.spec_from_file_location("loadtest_scenario", script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load script: {script_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(script_path.parent))
+    spec.loader.exec_module(module)
+
+    # 优先查找 build_scenario 函数
+    if hasattr(module, "build_scenario") and callable(module.build_scenario):
+        scenario = module.build_scenario()
+        if scenario is None:
+            raise ValueError("build_scenario() returned None")
+        return scenario
+
+    # 然后查找 scenario 变量
+    if hasattr(module, "scenario"):
+        return module.scenario
+
+    # 查找第一个 Scenario 类型的变量
+    from .scenario import Scenario as ScenarioType
+    for name, value in vars(module).items():
+        if isinstance(value, ScenarioType) and not name.startswith("_"):
+            return value
+
+    raise AttributeError(
+        f"Script {script_path} must define 'scenario' variable or 'build_scenario()' function"
+    )
+
+
+def _list_scenario(scenario) -> None:
+    """列出场景中的步骤和参数"""
+    print(f"\n📋 场景: {scenario.name}")
+    if scenario.description:
+        print(f"   描述: {scenario.description}")
+    if scenario.base_url:
+        print(f"   Base URL: {scenario.base_url}")
+
+    print(f"\n   共 {len(scenario.steps)} 个步骤:")
+    for i, step in enumerate(scenario.steps, 1):
+        enabled = "✓" if step.enabled else "✗"
+        req = step.request
+        print(f"   [{enabled}] Step {i}: {step.name}")
+        print(f"        {req.method.value} {req.url}")
+        if step.assertions:
+            print(f"        {len(step.assertions)} 个断言")
+            for a in step.assertions[:3]:
+                print(f"          - {a.name}")
+            if len(step.assertions) > 3:
+                print(f"          ... 共 {len(step.assertions)} 个")
+        if step.extractors:
+            print(f"        {len(step.extractors)} 个数据提取器")
+            for ex in step.extractors:
+                print(f"          - {ex.name} ({ex.source}: {ex.target})")
+        if step.think_time:
+            print(f"        Think time: {step.think_time}s")
+        if step.weight != 1:
+            print(f"        Weight: {step.weight}")
+
+    if scenario.parameters:
+        print(f"\n   共 {len(scenario.parameters)} 个参数:")
+        for param in scenario.parameters:
+            print(f"      - {param.name}: {param.type.value}")
+
+    print()
+
+
+def _build_config_from_args(args, scenario) -> LoadTestConfig:
+    """根据命令行参数构建压测配置"""
+    steps_cfg = []
+    if args.mode == "step":
+        if args.steps:
+            steps_cfg = _parse_steps_arg(args.steps)
+        else:
+            # 默认阶梯配置
+            steps_cfg = [
+                (30, args.concurrency, args.qps),
+                (30, args.concurrency * 2, args.qps * 2 if args.qps else None),
+                (30, args.concurrency * 4, args.qps * 4 if args.qps else None),
+            ]
+
+    return LoadTestConfig(
+        scenario=scenario,
+        load_mode=args.mode,
+        duration=args.duration,
+        concurrency=args.concurrency,
+        qps=args.qps,
+        warmup=args.warmup,
+        steps=steps_cfg,
+        start_concurrency=args.start_concurrency,
+        end_concurrency=args.end_concurrency,
+        start_qps=args.start_qps,
+        end_qps=args.end_qps,
+        ramp_duration=args.ramp_duration,
+        hold_end_duration=args.hold_end,
+        base_duration=args.base_duration,
+        spike_duration=args.spike_duration,
+        base_concurrency=args.base_concurrency,
+        spike_concurrency=args.spike_concurrency,
+        base_qps=args.base_qps,
+        spike_qps=args.spike_qps,
+        spike_count=args.spike_count,
+        report_dir=args.report_dir,
+        report_name=args.report_name,
+        output_console=not args.no_console,
+        output_json=not args.no_json,
+        output_html=not args.no_html,
+        enable_progress_bar=not args.no_progress,
+    )
+
+
+def _cmd_run(args) -> int:
+    """执行压测命令"""
+    script_path = Path(args.script)
+    try:
+        scenario = _load_scenario_from_file(script_path)
+    except Exception as e:
+        print(f"❌ 加载场景失败: {e}", file=sys.stderr)
+        return 1
+
+    # 如果是 list 模式，直接列出并退出
+    if args.list_only:
+        _list_scenario(scenario)
+        return 0
+
+    # 构建配置
+    try:
+        config = _build_config_from_args(args, scenario)
+    except Exception as e:
+        print(f"❌ 配置错误: {e}", file=sys.stderr)
+        return 1
+
+    # 列出场景信息
+    if args.verbose:
+        _list_scenario(scenario)
+
+    print(f"🚀 开始压测: {scenario.name}")
+    print(f"   模式: {args.mode} | 并发: {args.concurrency} | 时长: {args.duration}s" +
+          (f" | QPS: {args.qps}" if args.qps else ""))
+    print()
+
+    # 执行压测
+    engine = LoadTestEngine(config)
+    result = engine.run()
+
+    # 返回码：完全成功=0，高错误率=1，压测中断=2
+    if result.stopped_early:
+        return 2
+    if result.metrics.errors.error_rate > 0.05:
+        return 1
+    return 0
+
+
+def _cmd_list(args) -> int:
+    """列出场景信息"""
+    script_path = Path(args.script)
+    try:
+        scenario = _load_scenario_from_file(script_path)
+    except Exception as e:
+        print(f"❌ 加载场景失败: {e}", file=sys.stderr)
+        return 1
+    _list_scenario(scenario)
+    return 0
+
+
+def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("script", help="场景定义Python脚本路径")
+    parser.add_argument("-v", "--verbose", action="store_true", help="详细输出")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器"""
+    parser = argparse.ArgumentParser(
+        prog="load-tester",
+        description="高性能负载测试工具 - 可配置场景、可控并发、实时指标",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="命令")
+
+    # run 命令
+    run_parser = subparsers.add_parser("run", help="执行压测")
+    _add_common_arguments(run_parser)
+
+    # 负载模式
+    run_parser.add_argument("--mode", choices=["constant", "step", "ramp", "spike"],
+                           default="constant", help="负载模式 (默认: constant)")
+
+    # 恒定模式参数
+    run_parser.add_argument("-d", "--duration", type=float, default=60.0,
+                           help="压测总时长(秒) (默认: 60)")
+    run_parser.add_argument("-c", "--concurrency", type=int, default=10,
+                           help="并发用户数 (默认: 10)")
+    run_parser.add_argument("-q", "--qps", type=float, default=None,
+                           help="目标QPS (默认: 不限)")
+    run_parser.add_argument("-w", "--warmup", type=float, default=5.0,
+                           help="预热时长(秒) (默认: 5)")
+
+    # 阶梯模式参数
+    run_parser.add_argument("--steps", type=str, default=None,
+                           help='阶梯配置: "时长,并发,QPS;时长,并发,QPS;..." (step模式)')
+
+    # Ramp模式参数
+    run_parser.add_argument("--start-concurrency", type=int, default=1,
+                           help="起始并发数 (ramp模式)")
+    run_parser.add_argument("--end-concurrency", type=int, default=100,
+                           help="结束并发数 (ramp模式)")
+    run_parser.add_argument("--start-qps", type=float, default=None,
+                           help="起始QPS (ramp模式)")
+    run_parser.add_argument("--end-qps", type=float, default=None,
+                           help="结束QPS (ramp模式)")
+    run_parser.add_argument("--ramp-duration", type=float, default=300.0,
+                           help="渐增时长(秒) (ramp模式)")
+    run_parser.add_argument("--hold-end", type=float, default=30.0,
+                           help="峰值保持时长(秒) (ramp/spike模式)")
+
+    # Spike模式参数
+    run_parser.add_argument("--base-duration", type=float, default=60.0,
+                           help="基线时长(秒) (spike模式)")
+    run_parser.add_argument("--spike-duration", type=float, default=30.0,
+                           help="尖峰时长(秒) (spike模式)")
+    run_parser.add_argument("--base-concurrency", type=int, default=10,
+                           help="基线并发 (spike模式)")
+    run_parser.add_argument("--spike-concurrency", type=int, default=200,
+                           help="尖峰并发 (spike模式)")
+    run_parser.add_argument("--base-qps", type=float, default=None,
+                           help="基线QPS (spike模式)")
+    run_parser.add_argument("--spike-qps", type=float, default=None,
+                           help="尖峰QPS (spike模式)")
+    run_parser.add_argument("--spike-count", type=int, default=1,
+                           help="尖峰次数 (spike模式)")
+
+    # 报告配置
+    run_parser.add_argument("--report-dir", type=str, default="./reports",
+                           help="报告输出目录 (默认: ./reports)")
+    run_parser.add_argument("--report-name", type=str, default="loadtest_report",
+                           help="报告文件名 (默认: loadtest_report)")
+    run_parser.add_argument("--no-console", action="store_true",
+                           help="不输出控制台报告")
+    run_parser.add_argument("--no-json", action="store_true",
+                           help="不生成JSON报告")
+    run_parser.add_argument("--no-html", action="store_true",
+                           help="不生成HTML报告")
+    run_parser.add_argument("--no-progress", action="store_true",
+                           help="不显示实时进度条")
+    run_parser.add_argument("--list-only", action="store_true",
+                           help="只列出场景信息，不执行")
+
+    # list 命令
+    list_parser = subparsers.add_parser("list", help="列出场景中的步骤和参数")
+    _add_common_arguments(list_parser)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI主入口"""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "run":
+        return _cmd_run(args)
+    elif args.command == "list":
+        return _cmd_list(args)
+    else:
+        parser.print_help()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
